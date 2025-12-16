@@ -54,19 +54,21 @@ app.get("/health", async (req, res) => {
 // --- Symptom routes ---
 
 // Save today's symptoms
+// Save today's symptoms
 app.post("/symptoms/today", async (req, res) => {
   try {
-    const { date, symptoms, notes } = req.body;
+    const { date, symptoms, notes, userId: bodyUserId } = req.body;
     if (!date || !symptoms) {
       return res
         .status(400)
         .json({ error: "date and symptoms are required" });
     }
 
-    const docId = `${DEMO_USER_ID}_${date}`;
+    const userId = bodyUserId || DEMO_USER_ID;
+    const docId = `${userId}_${date}`;
 
     await db.collection("symptomEntries").doc(docId).set({
-      userId: DEMO_USER_ID,
+      userId,
       date,
       symptoms,
       notes: notes || "",
@@ -79,14 +81,17 @@ app.post("/symptoms/today", async (req, res) => {
   }
 });
 
+
+// Get symptom history
 // Get symptom history
 app.get("/symptoms", async (req, res) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, userId: queryUserId } = req.query;
+    const userId = queryUserId || DEMO_USER_ID;
 
     let query = db
       .collection("symptomEntries")
-      .where("userId", "==", DEMO_USER_ID)
+      .where("userId", "==", userId)
       .orderBy("date", "desc");
 
     if (from) query = query.where("date", ">=", from);
@@ -100,6 +105,7 @@ app.get("/symptoms", async (req, res) => {
     sendError(res, err, "symptoms");
   }
 });
+
 
 // --- Fitbit OAuth ---
 
@@ -212,6 +218,164 @@ app.get("/fitbit/status", async (req, res) => {
     });
   } catch (err) {
     sendError(res, err, "fitbit/status");
+  }
+});
+
+// --- Helpers to fetch Fitbit data ---
+
+async function getFitbitConnection(userId) {
+  const doc = await db.collection("fitbitConnections").doc(String(userId)).get();
+  if (!doc.exists) {
+    throw new Error("Fitbit is not connected for this user");
+  }
+  return { id: doc.id, ...doc.data() };
+}
+
+async function refreshFitbitAccessToken(userId, refreshToken, existingFitbitUserId) {
+  const tokenUrl = "https://api.fitbit.com/oauth2/token";
+  const clientId = process.env.FITBIT_CLIENT_ID;
+  const clientSecret = process.env.FITBIT_CLIENT_SECRET;
+
+  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+  }).toString();
+
+  const resp = await axios.post(tokenUrl, body, {
+    headers: {
+      Authorization: `Basic ${basicAuth}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+  });
+
+  const data = resp.data;
+
+  await db
+    .collection("fitbitConnections")
+    .doc(String(userId))
+    .set(
+      {
+        fitbitUserId: data.user_id || existingFitbitUserId || null,
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token,
+        scope: data.scope,
+        tokenType: data.token_type,
+        expiresIn: data.expires_in,
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+  return data;
+}
+
+
+async function fetchFitbitDailySummary(userId, targetDate) {
+  const connection = await getFitbitConnection(userId);
+  let accessToken = connection.accessToken;
+  const fitbitUserId = connection.fitbitUserId || "-";
+
+  async function fetchWithToken(token) {
+    const headers = {
+      Authorization: `Bearer ${token}`,
+    };
+
+    const activityUrl = `https://api.fitbit.com/1/user/${fitbitUserId}/activities/date/${targetDate}.json`;
+    const sleepUrl = `https://api.fitbit.com/1.2/user/${fitbitUserId}/sleep/date/${targetDate}.json`;
+
+    const [activityRes, sleepRes] = await Promise.all([
+      axios.get(activityUrl, { headers }),
+      axios.get(sleepUrl, { headers }),
+    ]);
+
+    const activity = activityRes.data;
+    const sleep = sleepRes.data;
+
+    const steps = activity?.summary?.steps ?? 0;
+    const calories = activity?.summary?.caloriesOut ?? 0;
+    const sleepMinutes =
+      sleep?.summary?.totalMinutesAsleep ??
+      (Array.isArray(sleep?.sleep)
+        ? sleep.sleep.reduce(
+            (sum, s) => sum + (s.minutesAsleep || 0),
+            0
+          )
+        : 0);
+
+    return { date: targetDate, steps, calories, sleepMinutes };
+  }
+
+  try {
+    return await fetchWithToken(accessToken);
+  } catch (err) {
+    if (err.response && err.response.status === 401 && connection.refreshToken) {
+      const refreshed = await refreshFitbitAccessToken(
+        userId,
+        connection.refreshToken,
+        fitbitUserId
+      );
+      accessToken = refreshed.access_token;
+      return await fetchWithToken(accessToken);
+    }
+    throw err;
+  }
+}
+
+
+// Get today's Fitbit summary (steps, calories, sleep) for a user
+// Get today's Fitbit summary using helper
+app.get("/fitbit/daily-summary", async (req, res) => {
+  try {
+    const { userId, date } = req.query;
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const today = new Date();
+    const isoDate = today.toISOString().slice(0, 10); // YYYY-MM-DD
+    const targetDate = (date && String(date)) || isoDate;
+
+    const summary = await fetchFitbitDailySummary(userId, targetDate);
+    res.json(summary);
+  } catch (err) {
+    sendError(res, err, "fitbit/daily-summary");
+  }
+});
+
+// Merge Fitbit data with symptoms for a given day
+app.get("/dashboard/day", async (req, res) => {
+  try {
+    const { userId: queryUserId, date } = req.query;
+    const userId = queryUserId || DEMO_USER_ID;
+
+    const today = new Date();
+    const isoDate = today.toISOString().slice(0, 10);
+    const targetDate = (date && String(date)) || isoDate;
+
+    // 1) Load symptom entry for that day
+    const docId = `${userId}_${targetDate}`;
+    const symptomDoc = await db.collection("symptomEntries").doc(docId).get();
+    const symptoms = symptomDoc.exists ? symptomDoc.data() : null;
+
+    // 2) Load Fitbit summary for that day
+    let fitbit = null;
+    try {
+      fitbit = await fetchFitbitDailySummary(userId, targetDate);
+    } catch (err) {
+      console.error("Error fetching Fitbit summary for dashboard:", err?.message || err);
+    }
+
+    // 3) Return merged view
+    res.json({
+      date: targetDate,
+      userId,
+      symptoms, // may be null
+      fitbit,   // may be null if not connected
+    });
+  } catch (err) {
+    sendError(res, err, "dashboard/day");
   }
 });
 
