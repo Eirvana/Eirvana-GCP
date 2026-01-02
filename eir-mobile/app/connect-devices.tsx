@@ -2,25 +2,21 @@ import React, { useEffect, useState } from "react";
 import { View, Text, Button, StyleSheet } from "react-native";
 import { useLocalSearchParams } from "expo-router";
 import * as WebBrowser from "expo-web-browser";
-import { useRouter } from "expo-router";
+import { getAuth } from "firebase/auth";
 
 const API_URL = "https://eir-backend-493785333909.us-central1.run.app";
 
-type Summary = {
-  date: string;
-  steps: number;
-  calories: number;
-  sleepMinutes: number;
-};
+// DEV ONLY: replace with your admin trigger token for testing.
+// Do NOT ship this value in production builds.
+const ADMIN_TRIGGER_TOKEN = "PASTE_ADMIN_TOKEN_HERE";
 
 export default function ConnectDevicesScreen() {
   const params = useLocalSearchParams<{ userId?: string; name?: string }>();
   const userId = params.userId || "demo-user-1";
   const name = params.name || "";
-  const router = useRouter();
+
   const [status, setStatus] = useState("");
   const [fitbitConnected, setFitbitConnected] = useState(false);
-  const [summary, setSummary] = useState<Summary | null>(null);
 
   const checkFitbitStatus = async () => {
     try {
@@ -33,9 +29,12 @@ export default function ConnectDevicesScreen() {
       setFitbitConnected(!!data.connected);
       if (data.connected) {
         setStatus("Fitbit is connected ✅");
+      } else {
+        setStatus("Fitbit not connected");
       }
     } catch (e: any) {
       console.log(e);
+      setStatus("Error checking Fitbit status");
     }
   };
 
@@ -58,7 +57,7 @@ export default function ConnectDevicesScreen() {
       }
       await WebBrowser.openBrowserAsync(data.url);
       setStatus(
-        "Fitbit page opened. Complete login, then return here and tap 'Check Fitbit connection'."
+        "Fitbit page opened. Complete login, then return here and tap 'Check connection'."
       );
     } catch (e: any) {
       console.log(e);
@@ -66,39 +65,45 @@ export default function ConnectDevicesScreen() {
     }
   };
 
-    const loadTodaySummary = async () => {
-    try {
-      setStatus("Loading today's Fitbit data...");
-
-      // Build local date YYYY-MM-DD
-      const now = new Date();
-      const yyyy = now.getFullYear();
-      const mm = String(now.getMonth() + 1).padStart(2, "0");
-      const dd = String(now.getDate()).padStart(2, "0");
-      const dateStr = `${yyyy}-${mm}-${dd}`;
-
-      const res = await fetch(
-        `${API_URL}/fitbit/daily-summary?userId=${encodeURIComponent(
-          String(userId)
-        )}&date=${dateStr}`
-      );
-      const data = await res.json();
-      if (data.error) {
-        setStatus("Error loading Fitbit data: " + data.error);
-        return;
-      }
-      setSummary(data);
-      setStatus(`Loaded Fitbit data for ${data.date} ✅`);
-    } catch (e: any) {
-      console.log(e);
-      setStatus("Error loading Fitbit data: " + e.message);
-    }
-  };
-
-
   const connectOura = () => {
     setStatus("Oura integration coming soon.");
   };
+
+
+// inside your component, replace the dev-token trigger with this:
+
+
+const triggerFetchIntraday = async () => {
+  try {
+    setStatus("Triggering intraday fetch...");
+    const auth = getAuth();
+    const user = auth.currentUser;
+    if (!user) {
+      setStatus("Not signed in. Please sign in.");
+      return;
+    }
+    // getIdToken(true) forces refresh so claims are current
+    const idToken = await user.getIdToken(true);
+
+    const res = await fetch(`${API_URL}/fitbit/fetch-intraday`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ userId: user.uid })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setStatus("Trigger failed: " + (data?.error || res.status));
+    } else {
+      setStatus("Fetch triggered");
+    }
+  } catch (err:any) {
+    console.error(err);
+    setStatus("Network error triggering fetch");
+  }
+};
 
   return (
     <View style={styles.container}>
@@ -118,57 +123,19 @@ export default function ConnectDevicesScreen() {
         <Button title="Check Fitbit connection" onPress={checkFitbitStatus} />
       </View>
 
-      {fitbitConnected && (
-        <View style={styles.buttonWrapper}>
-          <Button
-            title="Load today's Fitbit data"
-            onPress={loadTodaySummary}
-          />
-        </View>
-      )}
-		
-	  {fitbitConnected && (
-        <View style={styles.buttonWrapper}>
-          <Button
-            title="View today's dashboard"
-            onPress={() =>
-              router.push({
-                pathname: "/dashboard",
-                params: { userId, name },
-              })
-            }
-          />
-        </View>
-      )}
-	  
-	  <View style={styles.buttonWrapper}>
+      {/* Dev-only: trigger intraday fetch. Remove before shipping. */}
+      <View style={styles.buttonWrapper}>
         <Button
-          title="Record today's symptoms"
-          onPress={() =>
-            router.push({
-              pathname: "/symptoms",
-              params: { userId, name },
-            })
-          }
+          title="Trigger Fitbit Intraday Fetch (DEV)"
+          onPress={triggerFetchIntraday}
         />
       </View>
-	  
+
       <View style={styles.buttonWrapper}>
         <Button title="Connect Oura (coming soon)" onPress={connectOura} />
       </View>
 
       {status ? <Text style={styles.status}>{status}</Text> : null}
-
-      {summary && (
-        <View style={styles.summaryBox}>
-          <Text style={styles.summaryTitle}>
-            Fitbit summary for {summary.date}
-          </Text>
-          <Text>Steps: {summary.steps}</Text>
-          <Text>Calories: {summary.calories}</Text>
-          <Text>Sleep: {summary.sleepMinutes} minutes</Text>
-        </View>
-      )}
 
       <Text style={styles.note}>
         You can always connect devices later in Settings.
@@ -184,11 +151,4 @@ const styles = StyleSheet.create({
   buttonWrapper: { marginVertical: 8 },
   status: { marginTop: 16, color: "gray" },
   note: { marginTop: 24, fontSize: 12, color: "gray" },
-  summaryBox: {
-    marginTop: 24,
-    padding: 16,
-    borderRadius: 8,
-    borderWidth: 1,
-  },
-  summaryTitle: { fontWeight: "700", marginBottom: 8 },
 });

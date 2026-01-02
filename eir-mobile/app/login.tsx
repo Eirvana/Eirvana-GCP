@@ -1,6 +1,22 @@
+
 import React, { useState } from "react";
-import { View, Text, TextInput, Button, StyleSheet } from "react-native";
+import {
+  View,
+  Text,
+  TextInput,
+  Button,
+  StyleSheet,
+  Alert,
+  ActivityIndicator,
+} from "react-native";
 import { useRouter } from "expo-router";
+
+import { auth } from "../firebase"; // ensure this file exists and exports `auth`
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  updateProfile,
+} from "firebase/auth";
 
 export default function LoginScreen() {
   const router = useRouter();
@@ -8,15 +24,59 @@ export default function LoginScreen() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const onSubmit = () => {
-    const userId = email.trim().toLowerCase();
-    if (!userId) return;
+  const onSubmit = async () => {
+    const trimmedEmail = email.trim().toLowerCase();
+    if (!trimmedEmail || !password) {
+      Alert.alert("Error", "Email and password are required.");
+      return;
+    }
 
-    router.push({
-      pathname: "/connect-devices",
-      params: { userId, name },
-    });
+    setLoading(true);
+    try {
+      if (mode === "signup") {
+        // Create account
+        const userCredential = await createUserWithEmailAndPassword(
+          auth,
+          trimmedEmail,
+          password
+        );
+
+        // Optionally set displayName
+        if (name && auth.currentUser) {
+          await updateProfile(auth.currentUser, { displayName: name });
+        }
+
+        const uid = userCredential.user.uid;
+        const displayName = auth.currentUser?.displayName || name || "";
+
+        // Navigate to connect-devices with the real uid
+        router.replace({
+          pathname: "/connect-devices",
+          params: { userId: uid, name: displayName },
+        });
+      } else {
+        // Login
+        const userCredential = await signInWithEmailAndPassword(
+          auth,
+          trimmedEmail,
+          password
+        );
+        const uid = userCredential.user.uid;
+        const displayName = userCredential.user.displayName || "";
+
+        router.replace({
+          pathname: "/connect-devices",
+          params: { userId: uid, name: displayName },
+        });
+      }
+    } catch (e: any) {
+      console.error("Auth error", e);
+      Alert.alert("Authentication failed", e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -29,11 +89,7 @@ export default function LoginScreen() {
       {mode === "signup" && (
         <>
           <Text style={styles.label}>Name</Text>
-          <TextInput
-            style={styles.input}
-            value={name}
-            onChangeText={setName}
-          />
+          <TextInput style={styles.input} value={name} onChangeText={setName} />
         </>
       )}
 
@@ -54,15 +110,17 @@ export default function LoginScreen() {
         secureTextEntry
       />
 
-      <Button title={mode} onPress={onSubmit} />
+      {loading ? (
+        <ActivityIndicator style={{ marginTop: 12 }} />
+      ) : (
+        <Button title={mode === "signup" ? "Sign up" : "Sign in"} onPress={onSubmit} />
+      )}
 
       <Text
         style={styles.switch}
         onPress={() => setMode(mode === "signup" ? "login" : "signup")}
       >
-        {mode === "signup"
-          ? "Already have an account? Log in"
-          : "New here? Sign up"}
+        {mode === "signup" ? "Already have an account? Log in" : "New here? Sign up"}
       </Text>
     </View>
   );
