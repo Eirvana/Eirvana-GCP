@@ -47,34 +47,56 @@ export default function ConnectDevicesScreen() {
   }, []);
 
   // Start Fitbit connect flow (backend will embed uid in state)
-  const connectFitbit = async () => {
-    try {
-      setStatus("Opening Fitbit...");
-      const user = auth.currentUser;
-      if (!user) {
-        Alert.alert("Sign in required", "Please sign in before connecting Fitbit.");
-        setStatus("Not signed in");
-        return;
-      }
-      const idToken = await user.getIdToken(true);
-      const res = await fetch(`${API_URL}/fitbit/auth-url`, {
-        method: "GET",
-        headers: { Authorization: `Bearer ${idToken}` },
-      });
-      const data = await res.json();
-      if (!data.url) {
-        setStatus("Failed to get Fitbit URL");
-        Alert.alert("Error", JSON.stringify(data));
-        return;
-      }
-      // Open the Fitbit auth page in the system browser. Fitbit will redirect to your backend callback.
-      await WebBrowser.openBrowserAsync(data.url);
-      setStatus("Fitbit page opened; complete login in browser then return here and tap 'Check connection'.");
-    } catch (e: any) {
-      console.error("connectFitbit error", e);
-      setStatus("Error starting Fitbit connect: " + (e?.message || String(e)));
+const connectFitbit = async () => {
+  try {
+    setStatus("Opening Fitbit...");
+    const user = auth.currentUser;
+    console.log("auth.currentUser:", user);
+
+    if (!user) {
+      Alert.alert("Sign in required", "Please sign in before connecting Fitbit.");
+      setStatus("Not signed in");
+      return;
     }
-  };
+
+    const idToken = await user.getIdToken(true);
+    console.log("idToken (short):", idToken?.slice?.(0, 40));
+
+    const res = await fetch(`${API_URL}/fitbit/auth-url`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+
+    const text = await res.text();
+    console.log("fitbit/auth-url status:", res.status, "body:", text);
+
+    let data: any = null;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      console.warn("fitbit/auth-url returned non-JSON:", e);
+    }
+
+    if (!res.ok) {
+      setStatus("Failed to get Fitbit URL");
+      Alert.alert("Error", data?.error ? String(data.error) : text);
+      return;
+    }
+
+    if (!data?.url) {
+      setStatus("Failed to get Fitbit URL");
+      Alert.alert("Error", "Response missing url: " + text);
+      return;
+    }
+
+    await WebBrowser.openBrowserAsync(data.url);
+    setStatus("Fitbit page opened; complete login in browser then return here and tap 'Check connection'.");
+  } catch (e: any) {
+    console.error("connectFitbit error", e);
+    setStatus("Error starting Fitbit connect: " + (e?.message || String(e)));
+  }
+};
+
 
   // Trigger a per-user intraday fetch (authenticated)
   const triggerFetchIntraday = async () => {
