@@ -1,145 +1,136 @@
 import React, { useEffect, useState } from "react";
-import { View, Text, Button, StyleSheet } from "react-native";
+import { View, Text, Button, StyleSheet, Alert } from "react-native";
 import { useLocalSearchParams } from "expo-router";
 import * as WebBrowser from "expo-web-browser";
-import { getAuth } from "firebase/auth";
 
-const API_URL = "https://eir-backend-493785333909.us-central1.run.app";
+import { auth } from "../firebase"; // use the firebase.ts file you just added
 
-// DEV ONLY: replace with your admin trigger token for testing.
-// Do NOT ship this value in production builds.
-const ADMIN_TRIGGER_TOKEN = "PASTE_ADMIN_TOKEN_HERE";
+const API_URL = "https://eir-backend-493785333909.us-central1.run.app"; // replace with your deployed backend URL
 
 export default function ConnectDevicesScreen() {
-  const params = useLocalSearchParams<{ userId?: string; name?: string }>();
-  const userId = params.userId || "demo-user-1";
+  const params = useLocalSearchParams<{ name?: string }>();
   const name = params.name || "";
 
   const [status, setStatus] = useState("");
   const [fitbitConnected, setFitbitConnected] = useState(false);
 
+  // Check connection using authenticated endpoint
   const checkFitbitStatus = async () => {
     try {
-      const res = await fetch(
-        `${API_URL}/fitbit/status?userId=${encodeURIComponent(
-          String(userId)
-        )}`
-      );
+      const user = auth.currentUser;
+      if (!user) {
+        setStatus("Not signed in");
+        setFitbitConnected(false);
+        return;
+      }
+      const idToken = await user.getIdToken(true);
+      const res = await fetch(`${API_URL}/fitbit/status`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+          "Content-Type": "application/json",
+        },
+      });
       const data = await res.json();
       setFitbitConnected(!!data.connected);
-      if (data.connected) {
-        setStatus("Fitbit is connected ✅");
-      } else {
-        setStatus("Fitbit not connected");
-      }
+      setStatus(data.connected ? "Fitbit connected ✅" : "Fitbit not connected");
     } catch (e: any) {
       console.log(e);
       setStatus("Error checking Fitbit status");
+      setFitbitConnected(false);
     }
   };
 
   useEffect(() => {
+    // on mount, update connection state if signed in
     checkFitbitStatus();
   }, []);
 
+  // Start Fitbit connect flow (backend will embed uid in state)
   const connectFitbit = async () => {
     try {
       setStatus("Opening Fitbit...");
-      const res = await fetch(
-        `${API_URL}/fitbit/auth-url?userId=${encodeURIComponent(
-          String(userId)
-        )}`
-      );
+      const user = auth.currentUser;
+      if (!user) {
+        Alert.alert("Sign in required", "Please sign in before connecting Fitbit.");
+        setStatus("Not signed in");
+        return;
+      }
+      const idToken = await user.getIdToken(true);
+      const res = await fetch(`${API_URL}/fitbit/auth-url`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
       const data = await res.json();
       if (!data.url) {
         setStatus("Failed to get Fitbit URL");
+        Alert.alert("Error", JSON.stringify(data));
         return;
       }
+      // Open the Fitbit auth page in the system browser. Fitbit will redirect to your backend callback.
       await WebBrowser.openBrowserAsync(data.url);
-      setStatus(
-        "Fitbit page opened. Complete login, then return here and tap 'Check connection'."
-      );
+      setStatus("Fitbit page opened; complete login in browser then return here and tap 'Check connection'.");
     } catch (e: any) {
-      console.log(e);
-      setStatus("Error starting Fitbit connect: " + e.message);
+      console.error("connectFitbit error", e);
+      setStatus("Error starting Fitbit connect: " + (e?.message || String(e)));
     }
   };
 
-  const connectOura = () => {
-    setStatus("Oura integration coming soon.");
+  // Trigger a per-user intraday fetch (authenticated)
+  const triggerFetchIntraday = async () => {
+    try {
+      setStatus("Triggering intraday fetch...");
+      const user = auth.currentUser;
+      if (!user) {
+        setStatus("Not signed in");
+        Alert.alert("Sign in required", "Please sign in to trigger fetch.");
+        return;
+      }
+      const idToken = await user.getIdToken(true);
+      const res = await fetch(`${API_URL}/fitbit/fetch-intraday`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ userId: user.uid }), // backend verifies uid === caller
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.log("Trigger fetch error:", data);
+        setStatus("Trigger failed: " + (data?.error || res.status));
+        Alert.alert("Trigger failed", JSON.stringify(data));
+      } else {
+        setStatus("Intraday fetch triggered");
+        Alert.alert("Fetch triggered", JSON.stringify(data));
+      }
+    } catch (err: any) {
+      console.error("Network error triggering fetch:", err);
+      setStatus("Network error triggering fetch");
+      Alert.alert("Network error", err.message || String(err));
+    }
   };
-
-
-// inside your component, replace the dev-token trigger with this:
-
-
-const triggerFetchIntraday = async () => {
-  try {
-    setStatus("Triggering intraday fetch...");
-    const auth = getAuth();
-    const user = auth.currentUser;
-    if (!user) {
-      setStatus("Not signed in. Please sign in.");
-      return;
-    }
-    // getIdToken(true) forces refresh so claims are current
-    const idToken = await user.getIdToken(true);
-
-    const res = await fetch(`${API_URL}/fitbit/fetch-intraday`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${idToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ userId: user.uid })
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      setStatus("Trigger failed: " + (data?.error || res.status));
-    } else {
-      setStatus("Fetch triggered");
-    }
-  } catch (err:any) {
-    console.error(err);
-    setStatus("Network error triggering fetch");
-  }
-};
 
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Hi {name || "there"} 👋</Text>
-      <Text style={styles.subtitle}>
-        Do you want to connect your wearables now?
-      </Text>
+      <Text style={styles.subtitle}>Do you want to connect your wearables now?</Text>
 
       <View style={styles.buttonWrapper}>
-        <Button
-          title={fitbitConnected ? "Fitbit connected ✅" : "Connect Fitbit"}
-          onPress={connectFitbit}
-        />
+        <Button title={fitbitConnected ? "Fitbit connected ✅" : "Connect Fitbit"} onPress={connectFitbit} />
       </View>
 
       <View style={styles.buttonWrapper}>
         <Button title="Check Fitbit connection" onPress={checkFitbitStatus} />
       </View>
 
-      {/* Dev-only: trigger intraday fetch. Remove before shipping. */}
       <View style={styles.buttonWrapper}>
-        <Button
-          title="Trigger Fitbit Intraday Fetch (DEV)"
-          onPress={triggerFetchIntraday}
-        />
-      </View>
-
-      <View style={styles.buttonWrapper}>
-        <Button title="Connect Oura (coming soon)" onPress={connectOura} />
+        <Button title="Trigger Fitbit Intraday Fetch" onPress={triggerFetchIntraday} />
       </View>
 
       {status ? <Text style={styles.status}>{status}</Text> : null}
 
-      <Text style={styles.note}>
-        You can always connect devices later in Settings.
-      </Text>
+      <Text style={styles.note}>You can always connect devices later in Settings.</Text>
     </View>
   );
 }
