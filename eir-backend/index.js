@@ -4,6 +4,16 @@ const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
 
+
+const PROJECT =
+  process.env.GOOGLE_CLOUD_PROJECT ||
+  process.env.GCLOUD_PROJECT ||
+  process.env.PROJECT_ID ||
+  process.env.GCP_PROJECT ||
+  null;
+
+console.log("Resolved PROJECT:", PROJECT);
+
 // --- Firebase Admin init (idempotent) ---
 if (!admin.apps.length) {
   admin.initializeApp(); // uses default credentials on Cloud Run / local service account when set
@@ -69,7 +79,7 @@ async function requireAuth(req, res, next) {
 
 // Root check
 app.get("/", (req, res) => {
-  res.json({ status: "root-ok", project: process.env.GOOGLE_CLOUD_PROJECT || null });
+  res.json({ status: "root-ok", project: PROJECT });
 });
 
 // Health: write a debug doc to Firestore
@@ -81,7 +91,8 @@ app.get("/health", async (req, res) => {
       },
       { merge: true }
     );
-    res.json({ status: "ok", project: process.env.GOOGLE_CLOUD_PROJECT || null });
+    res.json({ status: "ok", project: PROJECT });
+
   } catch (err) {
     sendError(res, err, "health");
   }
