@@ -1,39 +1,75 @@
 const express = require("express");
-const bodyParser = require("body-parser");
+const helmet = require("helmet");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
 
-// --- Firebase Admin init ---
-try {
-  admin.initializeApp(); // uses project eirvanamobileapp + (default) DB
-} catch (err) {
-  console.error("Firebase Admin init error:", err);
+// --- Firebase Admin init (idempotent) ---
+if (!admin.apps.length) {
+  admin.initializeApp(); // uses default credentials on Cloud Run / local service account when set
 }
-
 const db = admin.firestore();
+
+// --- Env validation (warn if missing) ---
+const requiredEnvs = ["FITBIT_CLIENT_ID", "FITBIT_CLIENT_SECRET", "FITBIT_REDIRECT_URI"];
+requiredEnvs.forEach((k) => {
+  if (!process.env[k]) {
+    console.warn(`[WARN] environment variable ${k} is not set`);
+  }
+});
 
 // --- Express app setup ---
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+app.use(helmet());
 
-// TEMP user id until real auth
+// Configure CORS - allow Authorization header and configurable origins
+const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",") : [];
+app.use(
+  cors({
+    origin: allowedOrigins.length ? allowedOrigins : true,
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  })
+);
+
+// Use express.json() (body-parser built-in)
+app.use(express.json());
+
+// TEMP user id until real auth (only for dev flows)
 const DEMO_USER_ID = "demo-user-1";
 
-// Helper to send detailed errors
+// Helper to send detailed errors (logs server-side, returns safe message client-side)
 function sendError(res, err, ctx) {
-  console.error(`Error in ${ctx}:`, err);
+  console.error(`Error in ${ctx}:`, err && err.stack ? err.stack : err);
   res.status(500).json({
-    error: err?.message || JSON.stringify(err) || "unknown error",
+    error: err?.message || "internal_error",
   });
+}
+
+// --- Authentication middleware ---
+// Verifies Firebase ID token in Authorization: Bearer <idToken>
+// On success sets req.uid and req.authTokenClaims
+async function requireAuth(req, res, next) {
+  try {
+    const authHeader = req.header("authorization") || "";
+    const m = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (!m) return res.status(401).json({ error: "missing_id_token" });
+    const idToken = m[1];
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.uid = decoded.uid;
+    req.authTokenClaims = decoded;
+    return next();
+  } catch (err) {
+    console.error("requireAuth error:", err && err.message ? err.message : err);
+    return res.status(401).json({ error: "invalid_id_token" });
+  }
 }
 
 // --- Basic routes ---
 
 // Root check
 app.get("/", (req, res) => {
-  res.json({ status: "root-ok", project: process.env.GOOGLE_CLOUD_PROJECT });
+  res.json({ status: "root-ok", project: process.env.GOOGLE_CLOUD_PROJECT || null });
 });
 
 // Health: write a debug doc to Firestore
@@ -45,26 +81,28 @@ app.get("/health", async (req, res) => {
       },
       { merge: true }
     );
-    res.json({ status: "ok", project: process.env.GOOGLE_CLOUD_PROJECT });
+    res.json({ status: "ok", project: process.env.GOOGLE_CLOUD_PROJECT || null });
   } catch (err) {
     sendError(res, err, "health");
   }
 });
 
-// --- Symptom routes ---
+// --- Symptom routes (require auth in production) ---
 
-// Save today's symptoms
-// Save today's symptoms
-app.post("/symptoms/today", async (req, res) => {
+// Save today's symptoms (authenticated)
+app.post("/symptoms/today", requireAuth, async (req, res) => {
   try {
     const { date, symptoms, notes, userId: bodyUserId } = req.body;
     if (!date || !symptoms) {
-      return res
-        .status(400)
-        .json({ error: "date and symptoms are required" });
+      return res.status(400).json({ error: "date and symptoms are required" });
     }
 
-    const userId = bodyUserId || DEMO_USER_ID;
+    // Use authenticated uid as authoritative user id
+    const userId = bodyUserId ? String(bodyUserId) : req.uid || DEMO_USER_ID;
+    if (req.uid && userId !== req.uid) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
     const docId = `${userId}_${date}`;
 
     await db.collection("symptomEntries").doc(docId).set({
@@ -81,18 +119,16 @@ app.post("/symptoms/today", async (req, res) => {
   }
 });
 
-
-// Get symptom history
-// Get symptom history
-app.get("/symptoms", async (req, res) => {
+// Get symptom history (authenticated)
+app.get("/symptoms", requireAuth, async (req, res) => {
   try {
     const { from, to, userId: queryUserId } = req.query;
-    const userId = queryUserId || DEMO_USER_ID;
+    const userId = queryUserId ? String(queryUserId) : req.uid || DEMO_USER_ID;
+    if (req.uid && userId !== req.uid) {
+      return res.status(403).json({ error: "forbidden" });
+    }
 
-    let query = db
-      .collection("symptomEntries")
-      .where("userId", "==", userId)
-      .orderBy("date", "desc");
+    let query = db.collection("symptomEntries").where("userId", "==", userId).orderBy("date", "desc");
 
     if (from) query = query.where("date", ">=", from);
     if (to) query = query.where("date", "<=", to);
@@ -106,57 +142,56 @@ app.get("/symptoms", async (req, res) => {
   }
 });
 
-
 // --- Fitbit OAuth ---
 
-// Step 1: generate Fitbit authorization URL for a user
-app.get("/fitbit/auth-url", (req, res) => {
-  const { userId } = req.query;
-  if (!userId) {
-    return res.status(400).json({ error: "userId is required" });
-  }
-
+// Step 1: generate Fitbit authorization URL for the authenticated user
+// GET /fitbit/auth-url  (requires Authorization header)
+app.get("/fitbit/auth-url", requireAuth, (req, res) => {
+  const uid = req.uid;
   const clientId = process.env.FITBIT_CLIENT_ID;
   const redirectUri = process.env.FITBIT_REDIRECT_URI;
-
   if (!clientId || !redirectUri) {
-    return res
-      .status(500)
-      .json({ error: "Fitbit env vars not set on server" });
+    return res.status(500).json({ error: "Fitbit env vars not set" });
   }
 
+  // Scopes - include intraday in production if approved
   const scope = encodeURIComponent("activity heartrate sleep profile");
   const encodedRedirect = encodeURIComponent(redirectUri);
 
+  // state is uid so callback knows which Firestore doc to write
   const url =
     `https://www.fitbit.com/oauth2/authorize` +
     `?response_type=code` +
     `&client_id=${clientId}` +
     `&redirect_uri=${encodedRedirect}` +
     `&scope=${scope}` +
-    `&state=${encodeURIComponent(userId)}`; // pass userId via state
+    `&state=${encodeURIComponent(uid)}`;
 
   res.json({ url });
 });
 
-// Step 2: Fitbit redirects back here with ?code=...&state=userId
+// Step 2: Fitbit redirects back here with ?code=...&state=uid
+// This endpoint is called by Fitbit (browser redirect), so it can't be authenticated with Firebase token.
+// We rely on state to map to uid that initiated the flow.
 app.get("/fitbit/callback", async (req, res) => {
   try {
     const { code, state } = req.query;
-    const userId = state; // our internal user id
+    const uid = String(state || "");
 
-    if (!code || !userId) {
-      return res.status(400).send("Missing code or userId (state).");
+    if (!code || !uid) {
+      return res.status(400).send("Missing code or state.");
+    }
+
+    // Basic validation that state looks like a uid
+    if (typeof uid !== "string" || uid.length < 6) {
+      console.warn("Unexpected state uid in callback:", uid);
     }
 
     const tokenUrl = "https://api.fitbit.com/oauth2/token";
     const redirectUri = process.env.FITBIT_REDIRECT_URI;
     const clientId = process.env.FITBIT_CLIENT_ID;
     const clientSecret = process.env.FITBIT_CLIENT_SECRET;
-
-    const basicAuth = Buffer.from(
-      `${clientId}:${clientSecret}`
-    ).toString("base64");
+    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
     const body = new URLSearchParams({
       grant_type: "authorization_code",
@@ -173,38 +208,36 @@ app.get("/fitbit/callback", async (req, res) => {
 
     const data = tokenRes.data;
 
-    // Store tokens in Firestore
-    await db.collection("fitbitConnections").doc(userId).set(
-      {
-        fitbitUserId: data.user_id,
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token,
-        scope: data.scope,
-        tokenType: data.token_type,
-        expiresIn: data.expires_in,
-        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    // Persist tokens under document id = uid
+    // NOTE: Do not log tokens. Persist for server-side fetches only.
+    await db
+      .collection("fitbitConnections")
+      .doc(uid)
+      .set(
+        {
+          fitbitUserId: data.user_id,
+          accessToken: data.access_token,
+          refreshToken: data.refresh_token,
+          scope: data.scope,
+          tokenType: data.token_type,
+          expiresIn: data.expires_in,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
 
-    res.send(
-      "Fitbit connected! You can close this window and return to the app."
-    );
+    res.send("Fitbit connected. You can close this window and return to the app.");
   } catch (err) {
     console.error("Error in Fitbit callback:", err.response?.data || err);
     res.status(500).send("Error connecting Fitbit.");
   }
 });
 
-// Check if a user has connected Fitbit
-app.get("/fitbit/status", async (req, res) => {
+// Check if the authenticated user has connected Fitbit
+app.get("/fitbit/status", requireAuth, async (req, res) => {
   try {
-    const { userId } = req.query;
-    if (!userId) {
-      return res.status(400).json({ error: "userId is required" });
-    }
-
-    const doc = await db.collection("fitbitConnections").doc(String(userId)).get();
+    const uid = req.uid;
+    const doc = await db.collection("fitbitConnections").doc(String(uid)).get();
     if (!doc.exists) {
       return res.json({ connected: false });
     }
@@ -232,45 +265,49 @@ async function getFitbitConnection(userId) {
 }
 
 async function refreshFitbitAccessToken(userId, refreshToken, existingFitbitUserId) {
-  const tokenUrl = "https://api.fitbit.com/oauth2/token";
-  const clientId = process.env.FITBIT_CLIENT_ID;
-  const clientSecret = process.env.FITBIT_CLIENT_SECRET;
+  try {
+    const tokenUrl = "https://api.fitbit.com/oauth2/token";
+    const clientId = process.env.FITBIT_CLIENT_ID;
+    const clientSecret = process.env.FITBIT_CLIENT_SECRET;
 
-  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: refreshToken,
-  }).toString();
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+    }).toString();
 
-  const resp = await axios.post(tokenUrl, body, {
-    headers: {
-      Authorization: `Basic ${basicAuth}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-  });
-
-  const data = resp.data;
-
-  await db
-    .collection("fitbitConnections")
-    .doc(String(userId))
-    .set(
-      {
-        fitbitUserId: data.user_id || existingFitbitUserId || null,
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token,
-        scope: data.scope,
-        tokenType: data.token_type,
-        expiresIn: data.expires_in,
-        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    const resp = await axios.post(tokenUrl, body, {
+      headers: {
+        Authorization: `Basic ${basicAuth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
       },
-      { merge: true }
-    );
+    });
 
-  return data;
+    const data = resp.data;
+
+    await db
+      .collection("fitbitConnections")
+      .doc(String(userId))
+      .set(
+        {
+          fitbitUserId: data.user_id || existingFitbitUserId || null,
+          accessToken: data.access_token,
+          refreshToken: data.refresh_token,
+          scope: data.scope,
+          tokenType: data.token_type,
+          expiresIn: data.expires_in,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+    return data;
+  } catch (err) {
+    console.error("refreshFitbitAccessToken error:", err.response?.data || err);
+    throw err;
+  }
 }
-
 
 async function fetchFitbitDailySummary(userId, targetDate) {
   const connection = await getFitbitConnection(userId);
@@ -298,10 +335,7 @@ async function fetchFitbitDailySummary(userId, targetDate) {
     const sleepMinutes =
       sleep?.summary?.totalMinutesAsleep ??
       (Array.isArray(sleep?.sleep)
-        ? sleep.sleep.reduce(
-            (sum, s) => sum + (s.minutesAsleep || 0),
-            0
-          )
+        ? sleep.sleep.reduce((sum, s) => sum + (s.minutesAsleep || 0), 0)
         : 0);
 
     return { date: targetDate, steps, calories, sleepMinutes };
@@ -311,11 +345,7 @@ async function fetchFitbitDailySummary(userId, targetDate) {
     return await fetchWithToken(accessToken);
   } catch (err) {
     if (err.response && err.response.status === 401 && connection.refreshToken) {
-      const refreshed = await refreshFitbitAccessToken(
-        userId,
-        connection.refreshToken,
-        fitbitUserId
-      );
+      const refreshed = await refreshFitbitAccessToken(userId, connection.refreshToken, fitbitUserId);
       accessToken = refreshed.access_token;
       return await fetchWithToken(accessToken);
     }
@@ -323,46 +353,42 @@ async function fetchFitbitDailySummary(userId, targetDate) {
   }
 }
 
-
-// Get today's Fitbit summary (steps, calories, sleep) for a user
-// Get today's Fitbit summary using helper
-app.get("/fitbit/daily-summary", async (req, res) => {
+// Get today's Fitbit summary (steps, calories, sleep) for authenticated user
+app.get("/fitbit/daily-summary", requireAuth, async (req, res) => {
   try {
-    const { userId, date } = req.query;
-    if (!userId) {
-      return res.status(400).json({ error: "userId is required" });
-    }
+    const uid = req.uid;
+    const { date } = req.query;
 
     const today = new Date();
     const isoDate = today.toISOString().slice(0, 10); // YYYY-MM-DD
     const targetDate = (date && String(date)) || isoDate;
 
-    const summary = await fetchFitbitDailySummary(userId, targetDate);
+    const summary = await fetchFitbitDailySummary(uid, targetDate);
     res.json(summary);
   } catch (err) {
     sendError(res, err, "fitbit/daily-summary");
   }
 });
 
-// Merge Fitbit data with symptoms for a given day
-app.get("/dashboard/day", async (req, res) => {
+// Merge Fitbit data with symptoms for a given day (authenticated)
+app.get("/dashboard/day", requireAuth, async (req, res) => {
   try {
-    const { userId: queryUserId, date } = req.query;
-    const userId = queryUserId || DEMO_USER_ID;
+    const uid = req.uid;
+    const { date } = req.query;
 
     const today = new Date();
     const isoDate = today.toISOString().slice(0, 10);
     const targetDate = (date && String(date)) || isoDate;
 
     // 1) Load symptom entry for that day
-    const docId = `${userId}_${targetDate}`;
+    const docId = `${uid}_${targetDate}`;
     const symptomDoc = await db.collection("symptomEntries").doc(docId).get();
     const symptoms = symptomDoc.exists ? symptomDoc.data() : null;
 
     // 2) Load Fitbit summary for that day
     let fitbit = null;
     try {
-      fitbit = await fetchFitbitDailySummary(userId, targetDate);
+      fitbit = await fetchFitbitDailySummary(uid, targetDate);
     } catch (err) {
       console.error("Error fetching Fitbit summary for dashboard:", err?.message || err);
     }
@@ -370,20 +396,51 @@ app.get("/dashboard/day", async (req, res) => {
     // 3) Return merged view
     res.json({
       date: targetDate,
-      userId,
+      userId: uid,
       symptoms, // may be null
-      fitbit,   // may be null if not connected
+      fitbit, // may be null if not connected
     });
   } catch (err) {
     sendError(res, err, "dashboard/day");
   }
 });
 
+// --- Per-user fetch trigger (authenticated) ---
+// POST /fitbit/fetch-intraday  -> fetch intraday for authenticated user only
+app.post("/fitbit/fetch-intraday", requireAuth, async (req, res) => {
+  try {
+    const uid = req.uid;
+    // Call your per-user fetch logic (adjust to your fetch handler signature)
+    // Example: require('./fetch_fitbit_intraday') exports a function fetchForUser(uid)
+    const fetchHandler = require("./fetch_fitbit_intraday");
+    if (typeof fetchHandler.fetchForUser === "function") {
+      await fetchHandler.fetchForUser(uid);
+    } else {
+      // fallback: call existing handler but pass in the target user only
+      await new Promise((resolve, reject) => {
+        const fakeReq = { query: { userId: uid } };
+        const fakeRes = {
+          status(code) {
+            this.code = code;
+            return this;
+          },
+          send(body) {
+            resolve(body);
+          },
+        };
+        fetchHandler.handler(fakeReq, fakeRes).catch(reject);
+      });
+    }
+
+    res.json({ status: "fetch_triggered", userId: uid });
+  } catch (err) {
+    console.error("fetch-intraday error:", err);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
 
 // --- Start server (required for Cloud Run) ---
 const port = process.env.PORT || 8080;
 app.listen(port, () =>
-  console.log(
-    `eir-backend running on ${port} (project=${process.env.GOOGLE_CLOUD_PROJECT})`
-  )
+  console.log(`eir-backend running on ${port} (project=${process.env.GOOGLE_CLOUD_PROJECT || "local"})`)
 );
