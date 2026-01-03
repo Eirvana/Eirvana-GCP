@@ -2,6 +2,9 @@
 // Client-only Firebase init. Avoid top-level imports that run in Node (SSR/dev server).
 // Exports `auth` which is null on server and a Firebase Auth instance on client.
 
+import { initializeApp } from "firebase/app";
+import { getAuth } from "firebase/auth";
+
 let auth: any = null;
 let app: any = null;
 
