@@ -1,107 +1,152 @@
-// Lightweight example Node.js script for Cloud Run that fetches intraday minute HR for connected users
-// NOTE: adapt dataset/table names and error handling for production.
-
-const {BigQuery} = require('@google-cloud/bigquery');
-const axios = require('axios');
 const admin = require('firebase-admin');
-admin.initializeApp();
+const axios = require('axios');
+
 const db = admin.firestore();
 
-const bigquery = new BigQuery();
-const FITBIT_INTRADAY_TABLE = process.env.FITBIT_INTRADAY_TABLE || 'project.dataset.fitbit_minute';
+const FITBIT_TOKEN_URL = 'https://api.fitbit.com/oauth2/token';
+const FITBIT_API_BASE = 'https://api.fitbit.com/1';
 
-async function refreshFitbitAccessToken(userId, refreshToken) {
-  const tokenUrl = "https://api.fitbit.com/oauth2/token";
+async function getConnection(uid) {
+  const doc = await db.collection('fitbitConnections').doc(String(uid)).get();
+  if (!doc.exists) throw new Error('no_fitbit_connection');
+  return { id: doc.id, ...doc.data() };
+}
+
+async function refreshAccessTokenIfNeeded(uid, connection) {
+  // If token exists and not obviously expired, return it.
+  // We don't have explicit expiry timestamp persisted here, so we attempt request and refresh on 401.
+  return connection.accessToken;
+}
+
+async function refreshAccessToken(uid, refreshToken) {
   const clientId = process.env.FITBIT_CLIENT_ID;
   const clientSecret = process.env.FITBIT_CLIENT_SECRET;
-  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  if (!clientId || !clientSecret) throw new Error('fitbit_client_env_missing');
 
+  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
   const body = new URLSearchParams({
-    grant_type: "refresh_token",
+    grant_type: 'refresh_token',
     refresh_token: refreshToken,
   }).toString();
 
-  const res = await axios.post(tokenUrl, body, {
+  const resp = await axios.post(FITBIT_TOKEN_URL, body, {
     headers: {
       Authorization: `Basic ${basicAuth}`,
-      "Content-Type": "application/x-www-form-urlencoded",
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
+    timeout: 15000,
   });
-  return res.data;
+
+  const data = resp.data;
+  await db.collection('fitbitConnections').doc(String(uid)).set({
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    scope: data.scope,
+    tokenType: data.token_type,
+    expiresIn: data.expires_in,
+    lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  return data.access_token;
 }
 
-async function insertRows(rows) {
-  if (!rows.length) return;
-  await bigquery.dataset(process.env.BQ_DATASET).table(process.env.BQ_TABLE).insert(rows, { ignoreUnknownValues: true });
-}
+async function fetchIntradayForDate(accessToken, fitbitUserId, date) {
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+  };
 
-async function fetchIntradayForDate(accessToken, fitbitUserId, dateIso) {
-  // Example for heart rate intraday 1-minute series:
-  const url = `https://api.fitbit.com/1/user/${fitbitUserId}/activities/heart/date/${dateIso}/1d/1min.json`;
-  const res = await axios.get(url, { headers: { Authorization: `Bearer ${accessToken}` }});
-  // parse heart rate dataset
-  const series = res.data['activities-heart-intraday']?.dataset || [];
-  return series.map(pt => ({ timestamp: `${dateIso}T${pt.time}:00Z`, hr: pt.value }));
-}
+  // Heart rate intraday (1-sec resolution) — requires intraday access permission from Fitbit
+  const hrUrl = `${FITBIT_API_BASE}/user/${encodeURIComponent(fitbitUserId)}/activities/heart/date/${date}/1d/1sec.json`;
+  // Steps intraday (1-min resolution)
+  const stepsUrl = `${FITBIT_API_BASE}/user/${encodeURIComponent(fitbitUserId)}/activities/steps/date/${date}/1d/1min.json`;
 
-async function processUser(doc) {
-  const data = doc.data();
-  const userId = doc.id;
-  let accessToken = data.accessToken;
-  let refreshToken = data.refreshToken;
-  const fitbitUserId = data.fitbitUserId || '-';
+  const results = {};
 
-  const dateIso = (new Date()).toISOString().slice(0,10);
+  // Attempt both, but allow one to fail and return what succeeded.
   try {
-    const series = await fetchIntradayForDate(accessToken, fitbitUserId, dateIso);
-    const rows = series.map(s => ({
-      user_id: userId,
-      fitbit_user_id: fitbitUserId,
-      timestamp: s.timestamp,
-      hr: s.hr || null,
-      source: 'fitbit',
-      ingested_at: new Date().toISOString()
-    }));
-    await insertRows(rows);
+    const hrRes = await axios.get(hrUrl, { headers, timeout: 20000 });
+    results.heart = hrRes.data;
   } catch (err) {
-    // try token refresh on 401
-    if (err.response && err.response.status === 401 && refreshToken) {
-      const refreshed = await refreshFitbitAccessToken(userId, refreshToken);
-      accessToken = refreshed.access_token;
-      refreshToken = refreshed.refresh_token || refreshToken;
-      // persist refreshed tokens (consider encrypting)
-      await db.collection('fitbitConnections').doc(userId).set({
-        accessToken,
-        refreshToken,
-        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-      }, {merge: true});
-      const series = await fetchIntradayForDate(accessToken, fitbitUserId, dateIso);
-      const rows = series.map(s => ({
-        user_id: userId,
-        fitbit_user_id: fitbitUserId,
-        timestamp: s.timestamp,
-        hr: s.hr || null,
-        source: 'fitbit',
-        ingested_at: new Date().toISOString()
-      }));
-      await insertRows(rows);
-    } else {
-      console.error(`Failed to fetch for user ${userId}:`, err.message || err);
+    // Propagate to caller with structured info
+    const status = err.response?.status;
+    const data = err.response?.data;
+    results.heartError = { status, data, message: err.message };
+  }
+
+  try {
+    const stepsRes = await axios.get(stepsUrl, { headers, timeout: 20000 });
+    results.steps = stepsRes.data;
+  } catch (err) {
+    const status = err.response?.status;
+    const data = err.response?.data;
+    results.stepsError = { status, data, message: err.message };
+  }
+
+  return results;
+}
+
+async function fetchForUser(uid, requestedDate) {
+  if (!uid) throw new Error('missing_uid');
+
+  const connection = await getConnection(uid);
+  let accessToken = connection.accessToken;
+  const refreshToken = connection.refreshToken;
+  const fitbitUserId = connection.fitbitUserId || '-';
+
+  const date = requestedDate || (new Date()).toISOString().slice(0, 10); // YYYY-MM-DD
+
+  // Try fetch; if 401, try refresh + retry once
+  let intraday;
+  try {
+    intraday = await fetchIntradayForDate(accessToken, fitbitUserId, date);
+
+    // Detect 401s from either call
+    const had401 =
+      (intraday.heartError && intraday.heartError.status === 401) ||
+      (intraday.stepsError && intraday.stepsError.status === 401);
+
+    if (had401 && refreshToken) {
+      accessToken = await refreshAccessToken(uid, refreshToken);
+      intraday = await fetchIntradayForDate(accessToken, fitbitUserId, date);
     }
+  } catch (err) {
+    // Bubble up for the caller to log
+    throw err;
+  }
+
+  // Persist fetched intraday data (store both successes and error objects)
+  const docId = `${uid}_${date}`;
+  await db.collection('fitbitIntraday').doc(docId).set({
+    userId: uid,
+    date,
+    fitbitUserId,
+    data: intraday,
+    fetchedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  return { uid, date, storedDocId: docId, resultSummary: {
+    hasHeart: !!intraday.heart,
+    hasSteps: !!intraday.steps,
+    heartError: intraday.heartError || null,
+    stepsError: intraday.stepsError || null,
+  }};
+}
+
+// Express-style handler so index.js can call fetchHandler.handler(req,res)
+async function handler(req, res) {
+  try {
+    const userId = (req.query && req.query.userId) || (req.body && req.body.userId);
+    if (!userId) return res.status(400).json({ error: 'missing_userId' });
+
+    const result = await fetchForUser(userId, req.query.date);
+    res.json({ ok: true, result });
+  } catch (err) {
+    console.error('fetch_fitbit_intraday error:', err.response?.data || err.message || err);
+    res.status(500).json({ error: 'internal_error' });
   }
 }
 
-exports.handler = async (req, res) => {
-  try {
-    const snap = await db.collection('fitbitConnections').get();
-    const promises = [];
-    snap.forEach(doc => {
-      promises.push(processUser(doc));
-    });
-    await Promise.all(promises);
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('fetch_intraday error', err);
-    res.status(500).send('Error');
-  }
+module.exports = {
+  fetchForUser,
+  handler,
 };
