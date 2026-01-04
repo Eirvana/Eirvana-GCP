@@ -181,6 +181,12 @@ export default function ConnectDevicesScreen() {
         setLoadingFetch(false);
         return;
       }
+	  
+	  // after fetching data, show symptoms:
+	const res = await fetch(`${API_URL}/fitbit/symptoms?date=${localDateStr}`, { headers: { Authorization: `Bearer ${idToken}` }});
+	const json = await res.json();
+	console.log('symptoms', json.indicators);
+
       const dayJson = await dayRes.json();
       setDaySummary(dayJson);
       setStatus("Data fetched and summary loaded.");
