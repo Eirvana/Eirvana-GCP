@@ -4,7 +4,7 @@ const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
 const registerSymptomsRoutes = require('./fitbit_symptoms_route'); 
-registerSymptomsRoutes(app, db, requireAuth);
+
 
 const PROJECT =
   process.env.GOOGLE_CLOUD_PROJECT ||
@@ -76,6 +76,8 @@ async function requireAuth(req, res, next) {
   }
 }
 
+
+registerSymptomsRoutes(app, db, requireAuth);
 // --- Basic routes ---
 
 // Root check
