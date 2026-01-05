@@ -8,7 +8,7 @@
  *
  * Replace or merge with your current fetch_fitbit_intraday.js (keep existing error handling).
  */
-
+ 
 const admin = require('firebase-admin');
 const axios = require('axios');
 
