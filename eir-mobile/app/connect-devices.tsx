@@ -15,6 +15,25 @@ import { auth } from "../firebase"; // use the firebase.ts file you added
 
 const API_URL = "https://eir-backend-493785333909.us-central1.run.app"; // replace with your deployed backend URL
 
+
+
+const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+
+function yyyymmddInTZ(timeZone: string) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+const localDate = yyyymmddInTZ(tz);
+
+
+
+
 export default function ConnectDevicesScreen() {
   const params = useLocalSearchParams<{ name?: string }>();
   const name = params.name || "";
@@ -138,9 +157,8 @@ export default function ConnectDevicesScreen() {
       const idToken = await user.getIdToken(true);
 
       // Compute the user's local date (YYYY-MM-DD) using the device/browser local time
-      const now = new Date();
-      const localDateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-      console.log("Local date being requested:", localDateStr);
+     
+      console.log("Local date being requested:", localDate);
 
       // 1) Trigger backend fetch (this will attempt intraday then fallback to day),
       // send local date so backend fetches the correct day for the user.
@@ -150,7 +168,7 @@ export default function ConnectDevicesScreen() {
           Authorization: `Bearer ${idToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ date: localDateStr }),
+        body: JSON.stringify({ date: localDate,timeZone: tz, }),
       });
 
       const fetchJson = await fetchRes.json();
@@ -163,11 +181,28 @@ export default function ConnectDevicesScreen() {
         return;
       }
 
-      setFetchResult(fetchJson.result || fetchJson);
+     const r = fetchJson.result || fetchJson;
+
+// Normalize backend -> UI expected shape
+	const normalized = {
+	  storedDocId: r.docId ?? r.storedDocId ?? null,
+	  date: r.date ?? null,
+	  resultSummary: {
+		intradayDateUsed: r.date ?? null,
+		hasIntraday: !!r.hasIntraday,
+		intradayHasHeart: (r.heartCount ?? 0) > 0,
+		intradayHasSteps: (r.stepsCount ?? 0) > 0,
+		dayFetched: true, // your worker always fetches day summary
+  },
+  raw: r, // optional: keep original for debugging
+};
+
+setFetchResult(normalized);
+
       setStatus("Fetch complete — retrieving day summary...");
 
       // 2) Ask backend for a friendly day summary (activity + sleep) for the same date
-      const dayRes = await fetch(`${API_URL}/fitbit/daily-summary?date=${encodeURIComponent(localDateStr)}`, {
+      const dayRes = await fetch(`${API_URL}/fitbit/daily-summary?date=${encodeURIComponent(localDate)}`, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${idToken}`,
@@ -183,7 +218,7 @@ export default function ConnectDevicesScreen() {
       }
 	  
 	  // after fetching data, show symptoms:
-	const res = await fetch(`${API_URL}/fitbit/symptoms?date=${localDateStr}`, { headers: { Authorization: `Bearer ${idToken}` }});
+	const res = await fetch(`${API_URL}/fitbit/symptoms?date=${localDate}`, { headers: { Authorization: `Bearer ${idToken}` }});
 	const json = await res.json();
 	console.log('symptoms', json.indicators);
 
@@ -232,7 +267,11 @@ export default function ConnectDevicesScreen() {
         <Text style={styles.sectionTitle}>Fetch result (summary)</Text>
         {fetchResult ? (
           <View>
-            // insert/update in the Fetch result (summary) rendering block
+		    <Text style={styles.rawTitle}>Raw fetch result:</Text>
+			<Text style={styles.raw}>
+					{JSON.stringify(fetchResult?.raw ?? fetchResult, null, 2)}
+			</Text>
+            
 			<Text>StoredDocId: {fetchResult?.storedDocId || "n/a"}</Text>
 			<Text>Requested date: {fetchResult?.date || "n/a"}</Text>
 			<Text>Intraday date used: {fetchResult?.resultSummary?.intradayDateUsed ?? fetchResult?.date ?? "n/a"}</Text>
