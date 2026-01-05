@@ -424,34 +424,24 @@ app.get("/dashboard/day", requireAuth, async (req, res) => {
 app.post("/fitbit/fetch-intraday", requireAuth, async (req, res) => {
   try {
     const uid = req.uid;
-    // Call your per-user fetch logic (adjust to your fetch handler signature)
-    // Example: require('./fetch_fitbit_intraday') exports a function fetchForUser(uid)
-    const fetchHandler = require("./fetch_fitbit_intraday");
-    if (typeof fetchHandler.fetchForUser === "function") {
-      await fetchHandler.fetchForUser(uid);
-    } else {
-      // fallback: call existing handler but pass in the target user only
-      await new Promise((resolve, reject) => {
-        const fakeReq = { query: { userId: uid } };
-        const fakeRes = {
-          status(code) {
-            this.code = code;
-            return this;
-          },
-          send(body) {
-            resolve(body);
-          },
-        };
-        fetchHandler.handler(fakeReq, fakeRes).catch(reject);
-      });
-    }
 
-    res.json({ status: "fetch_triggered", userId: uid });
+    // pull requested date + timezone from the POST body
+    const date = req.body?.date || null;
+    const timeZone = req.body?.timeZone || null;
+
+    const fetchHandler = require("./fetch_fitbit_intraday");
+
+    // IMPORTANT: call fetchForUser with (uid, date, timeZone)
+    const result = await fetchHandler.fetchForUser(uid, date, timeZone);
+
+    // Return the result to the client (so UI can show docId/date/hasIntraday)
+    return res.json({ ok: true, result });
   } catch (err) {
     console.error("fetch-intraday error:", err);
-    res.status(500).json({ error: "internal_error" });
+    return res.status(500).json({ error: err?.message || "internal_error" });
   }
 });
+
 
 // --- Start server (required for Cloud Run) ---
 const port = process.env.PORT || 8080;

@@ -1,24 +1,48 @@
 /**
- * Updated fetch_fitbit_intraday.js
+ * fetch_fitbit_intraday.js
  *
- * This file builds on your existing fetch logic and now:
- * - Attempts intraday fetch, then day fallback (same as previously)
- * - Calls analyzeSymptoms(...) and persists the returned indicators to Firestore
- * - Stores symptom indicators under collection 'fitbitSymptomIndicators' doc id `${uid}_${date}`
- *
- * Replace or merge with your current fetch_fitbit_intraday.js (keep existing error handling).
+ * - Fetches Fitbit intraday HR + steps (timezone-safe)
+ * - Falls back to day summary when intraday unavailable
+ * - Runs symptom analysis
+ * - Persists results to Firestore
  */
- 
+
 const admin = require('firebase-admin');
 const axios = require('axios');
 
 const db = admin.firestore();
-
 const { analyzeSymptoms } = require('./analyze_fitbit_symptoms');
 
 const FITBIT_TOKEN_URL = 'https://api.fitbit.com/oauth2/token';
 const FITBIT_API_BASE = 'https://api.fitbit.com/1';
 
+/* =========================
+   Timezone-safe helpers
+   ========================= */
+function yyyymmddInTimeZone(timeZone, d = new Date()) {
+  // en-CA => YYYY-MM-DD
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+}
+function safeTimeZone(tz) {
+  // If tz is invalid, Intl.DateTimeFormat will throw.
+  // Fallback to LA.
+  try {
+    if (!tz) return 'America/Los_Angeles';
+    new Intl.DateTimeFormat('en-US', { timeZone: tz }).format(new Date());
+    return tz;
+  } catch {
+    return 'America/Los_Angeles';
+  }
+}
+
+/* =========================
+   Fitbit auth helpers
+   ========================= */
 async function getConnection(uid) {
   const doc = await db.collection('fitbitConnections').doc(String(uid)).get();
   if (!doc.exists) throw new Error('no_fitbit_connection');
@@ -45,6 +69,7 @@ async function refreshAccessToken(uid, refreshToken) {
   });
 
   const data = resp.data;
+
   await db.collection('fitbitConnections').doc(String(uid)).set({
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
@@ -57,13 +82,21 @@ async function refreshAccessToken(uid, refreshToken) {
   return data.access_token;
 }
 
+/* =========================
+   Fitbit fetchers
+   ========================= */
 async function fetchIntradayForDate(accessToken, fitbitUserId, date) {
   const headers = { Authorization: `Bearer ${accessToken}` };
 
-  const hrUrl = `${FITBIT_API_BASE}/user/${encodeURIComponent(fitbitUserId)}/activities/heart/date/${date}/1d/1sec.json`;
-  const stepsUrl = `${FITBIT_API_BASE}/user/${encodeURIComponent(fitbitUserId)}/activities/steps/date/${date}/1d/1min.json`;
+  const hrUrl =
+    `${FITBIT_API_BASE}/user/${encodeURIComponent(fitbitUserId)}` +
+    `/activities/heart/date/${date}/${date}/1min.json`;
 
-  const results = {};
+  const stepsUrl =
+    `${FITBIT_API_BASE}/user/${encodeURIComponent(fitbitUserId)}` +
+    `/activities/steps/date/${date}/${date}/1min.json`;
+
+  const results = { debug: { hrUrl, stepsUrl } };
 
   try {
     const hrRes = await axios.get(hrUrl, { headers, timeout: 20000 });
@@ -93,117 +126,107 @@ async function fetchIntradayForDate(accessToken, fitbitUserId, date) {
 async function fetchDaySummary(accessToken, fitbitUserId, date) {
   const headers = { Authorization: `Bearer ${accessToken}` };
 
-  const activityUrl = `${FITBIT_API_BASE}/user/${encodeURIComponent(fitbitUserId)}/activities/date/${date}.json`;
-  const sleepUrl = `${FITBIT_API_BASE}/1.2/user/${encodeURIComponent(fitbitUserId)}/sleep/date/${date}.json`;
+  const activityUrl =
+    `${FITBIT_API_BASE}/user/${encodeURIComponent(fitbitUserId)}/activities/date/${date}.json`;
+
+  const sleepUrl =
+    `${FITBIT_API_BASE}/1.2/user/${encodeURIComponent(fitbitUserId)}/sleep/date/${date}.json`;
 
   const day = {};
 
   try {
     const activityRes = await axios.get(activityUrl, { headers, timeout: 15000 });
-    const activity = activityRes.data;
-    day.activity = {
-      summary: activity?.summary || null,
-      goals: activity?.goals || null,
-      raw: activity,
-    };
-    // copy smart values to top-level summary for convenience
+    const a = activityRes.data;
+    day.activity = a;
     day.summary = {
-      steps: activity?.summary?.steps ?? null,
-      calories: activity?.summary?.caloriesOut ?? null,
-      restingHeartRate: activity?.summary?.restingHeartRate ?? null,
+      steps: a?.summary?.steps ?? null,
+      calories: a?.summary?.caloriesOut ?? null,
+      restingHeartRate: a?.summary?.restingHeartRate ?? null,
     };
   } catch (err) {
-    day.activityError = {
-      status: err.response?.status || null,
-      data: err.response?.data || null,
-      message: err.message,
-    };
+    day.activityError = err.response?.data || err.message;
   }
 
   try {
     const sleepRes = await axios.get(sleepUrl, { headers, timeout: 15000 });
-    const sleep = sleepRes.data;
-    day.sleep = sleep || null;
-    if (!day.summary) day.summary = {};
-    day.summary.sleepMinutes = sleep?.summary?.totalMinutesAsleep ?? null;
+    day.sleep = sleepRes.data;
+    day.summary = day.summary || {};
+    day.summary.sleepMinutes = sleepRes.data?.summary?.totalMinutesAsleep ?? null;
   } catch (err) {
-    day.sleepError = {
-      status: err.response?.status || null,
-      data: err.response?.data || null,
-      message: err.message,
-    };
+    day.sleepError = err.response?.data || err.message;
   }
 
   return day;
 }
 
-async function fetchForUser(uid, requestedDate) {
+/* =========================
+   Main worker
+   ========================= */
+async function fetchForUser(uid, requestedDate,timeZoneRaw) {
   if (!uid) throw new Error('missing_uid');
-
+   const timeZone = safeTimeZone(timeZoneRaw);
+   const todayLocal = yyyymmddInTimeZone(timeZone);
+   
+   
   const connection = await getConnection(uid);
   let accessToken = connection.accessToken;
   const refreshToken = connection.refreshToken;
   const fitbitUserId = connection.fitbitUserId || '-';
 
-  const date = requestedDate || (new Date()).toISOString().slice(0, 10); // YYYY-MM-DD
+  
+  let date = requestedDate || todayLocal;
+ if (typeof date === 'string') date = date.slice(0, 10);
 
-  // Try intraday, refresh token on 401 and retry once
-  let intradayResult;
-  try {
+  console.log('Fitbit fetch date:', date);
+   if (date > todayLocal) {
+    console.warn(`Clamping future date ${date} -> ${todayLocal} (tz=${timeZone})`);
+    date = todayLocal;
+  }
+
+  let intradayResult = await fetchIntradayForDate(accessToken, fitbitUserId, date);
+
+  const had401 =
+    intradayResult?.heartError?.status === 401 ||
+    intradayResult?.stepsError?.status === 401;
+
+  if (had401 && refreshToken) {
+    accessToken = await refreshAccessToken(uid, refreshToken);
     intradayResult = await fetchIntradayForDate(accessToken, fitbitUserId, date);
-
-    const had401 =
-      (intradayResult.heartError && intradayResult.heartError.status === 401) ||
-      (intradayResult.stepsError && intradayResult.stepsError.status === 401);
-
-    if (had401 && refreshToken) {
-      accessToken = await refreshAccessToken(uid, refreshToken);
-      intradayResult = await fetchIntradayForDate(accessToken, fitbitUserId, date);
-    }
-  } catch (err) {
-    intradayResult = { fetchError: { message: err.message || String(err), raw: err.response?.data || null } };
   }
 
-  // Decide if intraday data is usable
-  const hasIntraday =
-    (intradayResult.heart && Object.keys(intradayResult.heart).length > 0) ||
-    (intradayResult.steps && Object.keys(intradayResult.steps).length > 0);
+  const heartCount =
+    intradayResult?.heart?.['activities-heart-intraday']?.dataset?.length ?? 0;
 
-  let dayResult = null;
-  if (!hasIntraday) {
-    try {
-      dayResult = await fetchDaySummary(accessToken, fitbitUserId, date);
-    } catch (err) {
-      dayResult = { fetchError: { message: err.message || String(err), raw: err.response?.data || null } };
-    }
-  } else {
-    // also fetch day summary to have sleep & activity context
-    try {
-      dayResult = await fetchDaySummary(accessToken, fitbitUserId, date);
-    } catch (err) {
-      dayResult = { fetchError: { message: err.message || String(err), raw: err.response?.data || null } };
-    }
-  }
+  const stepsCount =
+    intradayResult?.steps?.['activities-steps-intraday']?.dataset?.length ?? 0;
 
-  // Persist fetched intraday and day into fitbitIntraday
+  const hasIntraday = heartCount > 0 || stepsCount > 0;
+
+  console.log('HR dataset:', heartCount, 'Steps dataset:', stepsCount);
+
+  const dayResult = await fetchDaySummary(accessToken, fitbitUserId, date);
+
   const docId = `${uid}_${date}`;
   const storedDoc = {
     userId: uid,
     date,
     fitbitUserId,
-    data: {
-      intraday: intradayResult || null,
-      day: dayResult || null,
-    },
     fetchedAt: admin.firestore.FieldValue.serverTimestamp(),
+    data: {
+      intraday: intradayResult,
+      day: dayResult,
+    },
+    debug: {
+      heartCount,
+      stepsCount,
+    },
   };
 
   await db.collection('fitbitIntraday').doc(docId).set(storedDoc, { merge: true });
 
-  // Run symptom analysis and persist to fitbitSymptomIndicators
   let analysis = null;
   try {
-    analysis = await require('./analyze_fitbit_symptoms').analyzeSymptoms(uid, date, intradayResult || {}, dayResult || {}, db);
+    analysis = await analyzeSymptoms(uid, date, intradayResult, dayResult, db);
     await db.collection('fitbitSymptomIndicators').doc(docId).set({
       userId: uid,
       date,
@@ -211,42 +234,41 @@ async function fetchForUser(uid, requestedDate) {
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
-    // also merge indicators into the fitbitIntraday doc under `analysis`
     await db.collection('fitbitIntraday').doc(docId).set({ analysis }, { merge: true });
   } catch (err) {
-    console.error('analysis error', err?.message || err);
+    console.error('analysis error:', err);
   }
 
   return {
     uid,
     date,
-    storedDocId: docId,
-    resultSummary: {
-      hasIntraday,
-      intradayHasHeart: !!(intradayResult && intradayResult.heart),
-      intradayHasSteps: !!(intradayResult && intradayResult.steps),
-      dayFetched: !!dayResult,
-      analysisSummary: {
-        // light summary for the client:
-        sleepDisruption: analysis?.sleep_disruption ?? null,
-        hotFlashCount: Array.isArray(analysis?.hot_flash_events) ? analysis.hot_flash_events.length : 0,
-        nightSweats: analysis?.night_sweats ?? null,
-        fatigue: analysis?.fatigue_recovery ?? null,
-        palpitationsCount: Array.isArray(analysis?.palpitations) ? analysis.palpitations.length : 0,
-      },
-    },
+    hasIntraday,
+    heartCount,
+    stepsCount,
+    docId,
   };
 }
 
+/* =========================
+   HTTP handler
+   ========================= */
 async function handler(req, res) {
   try {
-    const userId = (req.query && req.query.userId) || (req.body && req.body.userId) || (req.uid);
-    if (!userId) return res.status(400).json({ error: 'missing_userId' });
-    const date = (req.body && req.body.date) || (req.query && req.query.date) || null;
-    const result = await fetchForUser(userId, date);
+    const userId =
+      req.query?.userId ||
+      req.body?.userId ||
+      req.uid;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'missing_userId' });
+    }
+
+    const date = req.body?.date || req.query?.date || null;
+	 const timeZone = req.body?.timeZone || req.query?.timeZone || null;
+    const result = await fetchForUser(userId, date,timeZone);
     res.json({ ok: true, result });
   } catch (err) {
-    console.error('fetch_fitbit_intraday error:', err.response?.data || err.message || err);
+    console.error('fetch_fitbit_intraday error:', err);
     res.status(500).json({ error: 'internal_error' });
   }
 }
