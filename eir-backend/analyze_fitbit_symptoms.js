@@ -21,6 +21,106 @@
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+
+function toSec(hhmmss) {
+  // "12:34:00" -> seconds
+  const [h, m, s] = String(hhmmss || "0:0:0").split(":").map(Number);
+  return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
+}
+
+function inNightWindow(startTime) {
+  // Night = 10pm–6am (fallback if sleep window not available)
+  const t = toSec(startTime);
+  const start = 22 * 3600; // 22:00
+  const end = 6 * 3600;    // 06:00
+  return t >= start || t <= end; // crosses midnight
+}
+
+function clusterEventsByStartTime(events, clusterMinutes = 10) {
+  // Deduplicate overlapping detections: cluster by startTime proximity
+  const sorted = [...(events || [])].sort((a, b) => toSec(a.startTime) - toSec(b.startTime));
+  const clusters = [];
+
+  for (const e of sorted) {
+    if (!e?.startTime) continue;
+    const t = toSec(e.startTime);
+
+    const last = clusters[clusters.length - 1];
+    if (!last) {
+      clusters.push({ startTime: e.startTime, endTime: e.endTime, maxDelta: e.delta || 0 });
+      continue;
+    }
+
+    const lastT = toSec(last.startTime);
+    const gapSec = t - lastT;
+
+    if (gapSec <= clusterMinutes * 60) {
+      // same cluster
+      last.endTime = e.endTime || last.endTime;
+      last.maxDelta = Math.max(last.maxDelta, e.delta || 0);
+    } else {
+      clusters.push({ startTime: e.startTime, endTime: e.endTime, maxDelta: e.delta || 0 });
+    }
+  }
+  return clusters;
+}
+
+function severityFromCount(count) {
+  if (!count || count <= 0) return "None";
+  if (count <= 2) return "Low";
+  if (count <= 5) return "Moderate";
+  return "High";
+}
+
+function score01FromCount(count, denom) {
+  if (!denom) denom = 5;
+  return Math.max(0, Math.min(1, (count || 0) / denom));
+}
+
+
+function buildMenopauseSummary(indicators) {
+  const events = indicators?.hot_flash_events || [];
+
+  // 1) Hot flashes = clustered HR spike events
+  const hotFlashClusters = clusterEventsByStartTime(events, 10);
+  const hotFlashesCount = hotFlashClusters.length;
+
+  // 2) Night sweats = hot flash clusters occurring at night (10pm–6am)
+  const nightClusters = hotFlashClusters.filter(c => inNightWindow(c.startTime));
+  const nightSweatsCount = nightClusters.length;
+
+  // 3) Sleep disruption = based on night sweats (simple MVP)
+  // later you can incorporate sleep minutes, awakenings, etc.
+  const sleepDisruptionScore = Math.max(
+    score01FromCount(nightSweatsCount, 3), // 3+ night events = high disruption
+    indicators?.sleep_disruption?.score || 0 // if your analyzer sets this later
+  );
+
+  return {
+    hotFlashes: {
+      count: hotFlashesCount,
+      severity: severityFromCount(hotFlashesCount),
+      score: score01FromCount(hotFlashesCount, 5),
+      sampleTimes: hotFlashClusters.slice(0, 3).map(c => `${c.startTime}–${c.endTime || ""}`),
+    },
+    nightSweats: {
+      count: nightSweatsCount,
+      severity: severityFromCount(nightSweatsCount),
+      score: score01FromCount(nightSweatsCount, 3),
+      sampleTimes: nightClusters.slice(0, 3).map(c => `${c.startTime}–${c.endTime || ""}`),
+    },
+    sleepDisruption: {
+      severity:
+        sleepDisruptionScore >= 0.75 ? "High" :
+        sleepDisruptionScore >= 0.4 ? "Moderate" :
+        sleepDisruptionScore > 0 ? "Low" : "None",
+      score: Number(sleepDisruptionScore.toFixed(2)),
+      reason: nightSweatsCount > 0 ? "Night events detected" : "",
+    },
+  };
+}
+
+
 function safeNumber(v, fallback = null) {
   if (typeof v === 'number' && !isNaN(v)) return v;
   return fallback;
@@ -174,19 +274,34 @@ function getSleepPeriod(daySleep) {
   return null;
 }
 
-function inSleepWindow(timeStr, sleepPeriod) {
-  // timeStr is "HH:MM:SS" or ISO; sleepPeriod has start/end ISO
-  if (!sleepPeriod) return false;
-  if ((timeStr || '').length > 8 && (sleepPeriod.start || '').length > 8) {
-    // compare full ISO strings
-    const t = Date.parse(timeStr);
-    const s = Date.parse(sleepPeriod.start);
-    const e = Date.parse(sleepPeriod.end);
-    return t >= s && t <= e;
-  }
-  // fallback false
-  return false;
+function isoToTimeSec(isoStr) {
+  // isoStr like "2026-01-05T23:22:00.000"
+  if (!isoStr || typeof isoStr !== "string") return null;
+  const tPart = isoStr.split("T")[1];
+  if (!tPart) return null;
+  const hhmmss = tPart.split(".")[0]; // "23:22:00"
+  return timeToSec(hhmmss);
 }
+
+function inSleepWindow(timeStr, sleepPeriod) {
+  // timeStr is intraday "HH:MM:SS"
+  // sleepPeriod.start/end are ISO strings
+  if (!sleepPeriod?.start || !sleepPeriod?.end || !timeStr) return false;
+
+  const t = timeToSec(timeStr);
+  const s = isoToTimeSec(sleepPeriod.start);
+  const e = isoToTimeSec(sleepPeriod.end);
+  if (s === null || e === null) return false;
+
+  // handle sleep that crosses midnight (e.g. 23:00 -> 06:00)
+  if (e >= s) {
+    return t >= s && t <= e;
+  } else {
+    // crosses midnight: in window if t >= start OR t <= end
+    return t >= s || t <= e;
+  }
+}
+
 
 async function analyzeSymptoms(uid, date, intradayData, dayData, db) {
   // intradayData: { heart, steps, heartError, stepsError }
@@ -406,4 +521,101 @@ async function analyzeSymptoms(uid, date, intradayData, dayData, db) {
   return out;
 }
 
-module.exports = { analyzeSymptoms };
+async function analyzeFitbitSymptomsForDate(db, uid, date) {
+  // Reads your stored intraday+day doc from fitbitIntraday, analyzes, and stores a "signals" doc.
+  const docId = `${uid}_${date}`;
+  const snap = await db.collection("fitbitIntraday").doc(docId).get();
+
+  if (!snap.exists) {
+    return {
+      date,
+      indicators: null,
+      stored: false,
+      reason: `No fitbitIntraday doc found: ${docId}`,
+    };
+  }
+
+  const data = snap.data() || {};
+  const intradayData = data?.data?.intraday || null;
+  const dayData = data?.data?.day || null;
+
+  if (!intradayData) {
+    return {
+      date,
+      indicators: null,
+      stored: false,
+      reason: "Missing intraday data in stored document",
+    };
+  }
+
+  const indicators = await analyzeSymptoms(uid, date, intradayData, dayData, db);
+
+  // Store indicators so the app can load quickly without re-running analysis every time
+  await db
+    .collection("users")
+    .doc(String(uid))
+    .collection("signals")
+    .doc(String(date))
+    .set(
+      {
+        date,
+        indicators,
+        sourceDocId: docId,
+        generatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+
+  return { date, indicators, stored: true, sourceDocId: docId };
+}
+
+async function analyzeFitbitSymptomsForDate(db, uid, date) {
+  // Reads your stored intraday+day doc from fitbitIntraday, analyzes, and stores a "signals" doc.
+  const docId = `${uid}_${date}`;
+  const snap = await db.collection("fitbitIntraday").doc(docId).get();
+
+  if (!snap.exists) {
+    return {
+      date,
+      indicators: null,
+      stored: false,
+      reason: `No fitbitIntraday doc found: ${docId}`,
+    };
+  }
+
+  const data = snap.data() || {};
+  const intradayData = data?.data?.intraday || null;
+  const dayData = data?.data?.day || null;
+
+  if (!intradayData) {
+    return {
+      date,
+      indicators: null,
+      stored: false,
+      reason: "Missing intraday data in stored document",
+    };
+  }
+
+  const indicators = await analyzeSymptoms(uid, date, intradayData, dayData, db);
+
+  // Store indicators so the app can load quickly without re-running analysis every time
+  await db
+    .collection("users")
+    .doc(String(uid))
+    .collection("signals")
+    .doc(String(date))
+    .set(
+      {
+        date,
+        indicators,
+        sourceDocId: docId,
+        generatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+
+  return { date, indicators, stored: true, sourceDocId: docId };
+}
+
+
+module.exports = { analyzeSymptoms, analyzeFitbitSymptomsForDate };

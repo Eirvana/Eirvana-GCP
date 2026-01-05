@@ -266,7 +266,30 @@ async function handler(req, res) {
     const date = req.body?.date || req.query?.date || null;
 	 const timeZone = req.body?.timeZone || req.query?.timeZone || null;
     const result = await fetchForUser(userId, date,timeZone);
-    res.json({ ok: true, result });
+	// 1) load model config
+	const modelDoc = await db.collection("symptomModels").doc("default").get();
+	const model = modelDoc.exists ? modelDoc.data() : null;
+
+	// 2) load baseline (optional)
+	const baselineDoc = await db.collection("users").doc(uid).collection("fitbitBaselines").doc("current").get();
+	const baseline = baselineDoc.exists ? baselineDoc.data() : null;
+
+	// 3) analyze (your function should accept model + baseline)
+	const indicators = await analyzeSymptoms(uid, result.date, intradayData, dayData, db, { model, baseline });
+
+	// 4) store computed results
+	await db.collection("users").doc(uid).collection("signals").doc(result.date).set({
+	  date: result.date,
+	  source: { fitbitIntradayDocId: result.docId },
+	  modelVersion: model?.version ?? 1,
+	  indicators,
+	  generatedAt: new Date().toISOString()
+	}, { merge: true });
+
+
+	const { analyzeFitbitSymptomsForDate } = require("./analyze_fitbit_symptoms");
+    const indicators = await analyzeFitbitSymptomsForDate(uid, result.date);
+    res.json({ ok: true, result, indicators });
   } catch (err) {
     console.error('fetch_fitbit_intraday error:', err);
     res.status(500).json({ error: 'internal_error' });

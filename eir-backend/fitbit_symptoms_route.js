@@ -9,6 +9,7 @@
  * - GET /fitbit/symptoms?date=YYYY-MM-DD   (requires requireAuth)
  *    returns the stored indicators for the authenticated user for that date (or most recent)
  */
+const { analyzeFitbitSymptomsForDate } = require("./analyze_fitbit_symptoms");
 
 module.exports = function registerSymptomsRoutes(app, db, requireAuth) {
   app.get('/fitbit/symptoms', requireAuth, async (req, res) => {
@@ -16,21 +17,43 @@ module.exports = function registerSymptomsRoutes(app, db, requireAuth) {
       const uid = req.uid;
       const date = req.query.date || null;
       if (date) {
-        const docId = `${uid}_${date}`;
-        const doc = await db.collection('fitbitSymptomIndicators').doc(docId).get();
-        if (!doc.exists) return res.status(404).json({ error: 'not_found' });
-        return res.json({ ok: true, indicators: doc.data() });
-      } else {
-        // find most recent indicator doc for this user
-        const snap = await db.collection('fitbitSymptomIndicators')
-          .where('userId', '==', String(uid))
-          .orderBy('date', 'desc')
-          .limit(1)
-          .get();
-        if (snap.empty) return res.status(404).json({ error: 'not_found' });
-        const d = snap.docs[0].data();
-        return res.json({ ok: true, indicators: d });
-      }
+	  const docId = `${uid}_${date}`;
+
+	  // 1) Try existing stored indicators first
+	  const doc = await db.collection("fitbitSymptomIndicators").doc(docId).get();
+	  if (doc.exists) {
+		return res.json({ ok: true, indicators: doc.data() });
+	  }
+
+	  // 2) Not found -> compute from fitbitIntraday and store indicators
+	  const computed = await analyzeFitbitSymptomsForDate(db, uid, date);
+
+	  if (!computed?.indicators) {
+		return res.status(404).json({
+		  error: "not_found",
+		  reason: computed?.reason || "no_indicators",
+		});
+	  }
+
+	  // Store into the same collection this route already uses
+	  await db.collection("fitbitSymptomIndicators").doc(docId).set(
+		{
+		  userId: String(uid),
+		  date: String(date),
+		  ...computed.indicators,
+		  generatedAt: new Date().toISOString(),
+		  sourceDocId: computed.sourceDocId || null,
+		},
+		{ merge: true }
+	  );
+
+  return res.json({
+  ok: true,
+  indicators: doc.data()?.indicators || doc.data(),
+  menopauseSummary: doc.data()?.indicators?.menopauseSummary || null
+});
+
+
     } catch (err) {
       console.error('fitbit/symptoms error:', err?.message || err);
       res.status(500).json({ error: 'internal_error' });
