@@ -232,13 +232,14 @@ export default function ConnectDevicesScreen() {
         <Text style={styles.sectionTitle}>Fetch result (summary)</Text>
         {fetchResult ? (
           <View>
-            <Text>StoredDocId: {fetchResult?.storedDocId || "n/a"}</Text>
-            <Text>HasIntraday: {String(fetchResult?.resultSummary?.hasIntraday)}</Text>
-            <Text>Intraday heart present: {String(fetchResult?.resultSummary?.intradayHasHeart)}</Text>
-            <Text>Intraday steps present: {String(fetchResult?.resultSummary?.intradayHasSteps)}</Text>
-            <Text>Day fetched: {String(fetchResult?.resultSummary?.dayFetched)}</Text>
-            <Text style={styles.rawTitle}>Raw fetch result:</Text>
-            <Text style={styles.raw}>{JSON.stringify(fetchResult, null, 2)}</Text>
+            // insert/update in the Fetch result (summary) rendering block
+			<Text>StoredDocId: {fetchResult?.storedDocId || "n/a"}</Text>
+			<Text>Requested date: {fetchResult?.date || "n/a"}</Text>
+			<Text>Intraday date used: {fetchResult?.resultSummary?.intradayDateUsed ?? fetchResult?.date ?? "n/a"}</Text>
+			<Text>HasIntraday: {fetchResult?.resultSummary?.hasIntraday ? 'true' : 'false'}</Text>
+			<Text>Intraday heart present: {fetchResult?.resultSummary?.intradayHasHeart ? 'true' : 'false'}</Text>
+			<Text>Intraday steps present: {fetchResult?.resultSummary?.intradayHasSteps ? 'true' : 'false'}</Text>
+			<Text>Day fetched: {fetchResult?.resultSummary?.dayFetched ? 'true' : 'false'}</Text>
           </View>
         ) : (
           <Text style={styles.placeholder}>No fetch result yet.</Text>
