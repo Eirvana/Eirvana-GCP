@@ -1,7 +1,14 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { View, Text, Button, StyleSheet, ScrollView, ActivityIndicator } from "react-native";
+import {
+  View,
+  Text,
+  Button,
+  StyleSheet,
+  ScrollView,
+  ActivityIndicator,
+} from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { auth } from "../firebase"; // same pattern as connect-devices
+import { auth } from "../firebase";
 
 const API_URL = "https://eir-backend-493785333909.us-central1.run.app";
 
@@ -12,6 +19,31 @@ function yyyymmddInTZ(timeZone: string) {
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
+}
+
+function levelFromScore(score: number) {
+  if (score >= 0.75) return "High";
+  if (score >= 0.4) return "Moderate";
+  if (score > 0) return "Low";
+  return "None";
+}
+
+function SummaryRow({
+  label,
+  value,
+  sub,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+}) {
+  return (
+    <View style={styles.row}>
+      <Text style={styles.rowLabel}>{label}</Text>
+      <Text style={styles.rowValue}>{value}</Text>
+      {sub ? <Text style={styles.rowSub}>{sub}</Text> : null}
+    </View>
+  );
 }
 
 export default function SymptomsScreen() {
@@ -26,19 +58,6 @@ export default function SymptomsScreen() {
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [symptomsPayload, setSymptomsPayload] = useState<any>(null);
-  
-  function SummaryRow({ label, value, sub }: { label: string; value: string; sub?: string }) {
-  return (
-    <View style={styles.row}>
-      <Text style={styles.rowLabel}>{label}</Text>
-      <Text style={styles.rowValue}>{value}</Text>
-      {sub ? <Text style={styles.rowSub}>{sub}</Text> : null}
-    </View>
-  );
-}
-
-
-
 
   const loadFitbitSymptoms = async () => {
     try {
@@ -49,7 +68,6 @@ export default function SymptomsScreen() {
       const user = auth.currentUser;
       if (!user) {
         setStatus("Not signed in. Please sign in first.");
-        setLoading(false);
         return;
       }
 
@@ -67,9 +85,14 @@ export default function SymptomsScreen() {
       );
 
       const json = await res.json();
+	  
+	  console.log("[symptoms] FULL json:", json);
+	   console.log("[symptoms] json.raw exists?", !!json?.raw);
+		console.log("[symptoms] json.raw keys:", json?.raw ? Object.keys(json.raw) : null);
+		setSymptomsPayload(json); 
+
       if (!res.ok) {
         setStatus(`Error loading symptoms: ${json?.error || res.status}`);
-        setLoading(false);
         return;
       }
 
@@ -87,44 +110,29 @@ export default function SymptomsScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [date]);
 
-  const indicators = symptomsPayload?.indicators ?? symptomsPayload?.result ?? null;
-  const hotFlashCount = indicators?.indicators?.hot_flash_events?.length
-  ?? indicators?.hot_flash_events?.length
-  ?? 0;
+  // Your endpoint returns { ok:true, indicators: <doc> }.
+  // Sometimes <doc> itself includes { indicators: {...} }.
+  const top = symptomsPayload?.indicators ?? symptomsPayload?.result ?? null;
+  const coreIndicators = top?.indicators ?? top ?? null;
 
-const nightSweatsFlag = indicators?.indicators?.night_sweats?.flag
-  ?? indicators?.night_sweats?.flag
-  ?? false;
+  // Fallback fields (if menopauseSummary isn't present)
+  const hotFlashCount = coreIndicators?.hot_flash_events?.length ?? 0;
 
-const nightSweatsScore = indicators?.indicators?.night_sweats?.score
-  ?? indicators?.night_sweats?.score
-  ?? 0;
+  const nightSweatsFlag = coreIndicators?.night_sweats?.flag ?? false;
+  const nightSweatsScore = coreIndicators?.night_sweats?.score ?? 0;
 
-const sleepDisruptionFlag = indicators?.indicators?.sleep_disruption?.flag
-  ?? indicators?.sleep_disruption?.flag
-  ?? false;
+  const sleepDisruptionFlag = coreIndicators?.sleep_disruption?.flag ?? false;
+  const sleepDisruptionScore = coreIndicators?.sleep_disruption?.score ?? 0;
 
-const sleepDisruptionScore = indicators?.indicators?.sleep_disruption?.score
-  ?? indicators?.sleep_disruption?.score
-  ?? 0;
-
-const menopauseSummary =
-  indicators?.indicators?.menopauseSummary ??
-  indicators?.menopauseSummary ??
-  null;
-
-function levelFromScore(score: number) {
-  if (score >= 0.75) return "High";
-  if (score >= 0.4) return "Moderate";
-  if (score > 0) return "Low";
-  return "None";
-}
-
-
-
+  // Preferred summary (if backend provides it)
+  const menopauseSummary =
+    coreIndicators?.menopauseSummary ??
+    top?.menopauseSummary ??
+    null;
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
+	
       <Text style={styles.title}>Fitbit Symptom Insights</Text>
       <Text style={styles.subtitle}>
         Hi {name || "there"} — Date: {date} (TZ: {tz})
@@ -139,78 +147,101 @@ function levelFromScore(score: number) {
       </View>
 
       <Text style={styles.status}>{status}</Text>
+	  
+
 
       <View style={styles.section}>
-  <Text style={styles.sectionTitle}>Menopause Summary (from Fitbit)</Text>
+        <Text style={styles.sectionTitle}>Menopause Summary (from Fitbit)</Text>
 
-  {indicators ? (
-    <>
-      <SummaryRow
-        label="Hot flashes"
-        value={`${hotFlashCount}`}
-        sub="Detected from HR spikes + low steps"
-      />
+        {!coreIndicators ? (
+          <Text style={styles.placeholder}>
+            No indicators returned yet. (Try “Fetch Fitbit data” first, then come back.)
+          </Text>
+        ) : menopauseSummary ? (
+          <>
+            <SummaryRow
+              label="Hot flashes"
+              value={`${menopauseSummary.hotFlashes?.count ?? 0} • ${
+                menopauseSummary.hotFlashes?.severity ?? "n/a"
+              }`}
+              sub={
+                menopauseSummary.hotFlashes?.sampleTimes?.length
+                  ? `Examples: ${menopauseSummary.hotFlashes.sampleTimes.join(", ")}`
+                  : ""
+              }
+            />
 
-      <SummaryRow
-        label="Night sweats"
-        value={`${nightSweatsFlag ? "Yes" : "No"} • ${levelFromScore(nightSweatsScore)}`}
-        sub={`Score: ${Math.round(nightSweatsScore * 100)}%`}
-      />
+            <SummaryRow
+              label="Night sweats"
+              value={`${menopauseSummary.nightSweats?.count ?? 0} • ${
+                menopauseSummary.nightSweats?.severity ?? "n/a"
+              }`}
+              sub={
+                menopauseSummary.nightSweats?.sampleTimes?.length
+                  ? `Examples: ${menopauseSummary.nightSweats.sampleTimes.join(", ")}`
+                  : ""
+              }
+            />
 
-      <SummaryRow
-        label="Sleep disruption"
-        value={`${sleepDisruptionFlag ? "Yes" : "No"} • ${levelFromScore(sleepDisruptionScore)}`}
-        sub={`Score: ${Math.round(sleepDisruptionScore * 100)}%`}
-      />
-{menopauseSummary ? (
-  <>
-    <SummaryRow
-      label="Hot flashes"
-      value={`${menopauseSummary.hotFlashes.count} • ${menopauseSummary.hotFlashes.severity}`}
-      sub={
-        menopauseSummary.hotFlashes.sampleTimes?.length
-          ? `Examples: ${menopauseSummary.hotFlashes.sampleTimes.join(", ")}`
-          : "No events detected"
-      }
-    />
+            <SummaryRow
+              label="Sleep disruption"
+              value={`${menopauseSummary.sleepDisruption?.severity ?? "n/a"} • ${
+                menopauseSummary.sleepDisruption?.score != null
+                  ? levelFromScore(Number(menopauseSummary.sleepDisruption.score))
+                  : "n/a"
+              }`}
+              sub={menopauseSummary.sleepDisruption?.reason ?? ""}
+            />
+          </>
+        ) : (
+          <>
+            <SummaryRow
+              label="Hot flashes"
+              value={`${hotFlashCount}`}
+              sub="Detected from HR spikes + low steps"
+            />
 
-    <SummaryRow
-      label="Night sweats"
-      value={`${menopauseSummary.nightSweats.count} • ${menopauseSummary.nightSweats.severity}`}
-      sub={
-        menopauseSummary.nightSweats.sampleTimes?.length
-          ? `Examples: ${menopauseSummary.nightSweats.sampleTimes.join(", ")}`
-          : "No night events detected"
-      }
-    />
+            <SummaryRow
+              label="Night sweats"
+              value={`${nightSweatsFlag ? "Yes" : "No"} • ${levelFromScore(
+                Number(nightSweatsScore)
+              )}`}
+              sub={`Score: ${Math.round(Number(nightSweatsScore) * 100)}%`}
+            />
 
-    <SummaryRow
-      label="Sleep disruption"
-      value={`${menopauseSummary.sleepDisruption.severity}`}
-      sub={
-        menopauseSummary.sleepDisruption.reason
-          ? menopauseSummary.sleepDisruption.reason
-          : "Based on night-time heart rate patterns"
-      }
-    />
-  </>
-) : (
-  <>
-    <Text style={styles.rawTitle}>Raw indicators (debug):</Text>
-    <Text style={styles.raw}>{JSON.stringify(indicators, null, 2)}</Text>
-  </>
-)}
+            <SummaryRow
+              label="Sleep disruption"
+              value={`${sleepDisruptionFlag ? "Yes" : "No"} • ${levelFromScore(
+                Number(sleepDisruptionScore)
+              )}`}
+              sub={`Score: ${Math.round(Number(sleepDisruptionScore) * 100)}%`}
+            />
 
-      
-    </>
-  ) : (
-    <Text style={styles.placeholder}>
-      No indicators returned yet. (Try “Fetch Fitbit data” first, then come back.)
-    </Text>
-  )}
-</View>
+            <Text style={styles.rawTitle}>Raw indicators (debug):</Text>
+            <Text style={styles.raw}>
+              {JSON.stringify(top, null, 2)}
+            </Text>
+          </>
+        )}
+      </View>
 
 
+	   //Debug Start 
+	 
+	 <Text style={styles.rawTitle}>Raw response (debug)</Text>
+	<Text style={styles.raw}>
+	  {JSON.stringify(symptomsPayload, null, 2)}
+	</Text>
+	 
+	 
+	 
+	 <Text style={styles.rawTitle}>Raw Fitbit data (debug)</Text>
+	<Text style={styles.raw}>
+	  {JSON.stringify(symptomsPayload?.raw ?? null, null, 2)}
+	</Text>
+	  	 
+	  //Debug End
+	
       <View style={{ marginTop: 20 }}>
         <Button
           title="Back to Connect Devices"
@@ -246,23 +277,23 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#222",
   },
-  row: {
-  paddingVertical: 10,
-  borderBottomWidth: 1,
-  borderColor: "#eee",
-},
-rowLabel: {
-  fontWeight: "700",
-  fontSize: 15,
-},
-rowValue: {
-  marginTop: 2,
-  fontSize: 15,
-},
-rowSub: {
-  marginTop: 2,
-  fontSize: 12,
-  color: "#666",
-},
 
+  row: {
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderColor: "#eee",
+  },
+  rowLabel: {
+    fontWeight: "700",
+    fontSize: 15,
+  },
+  rowValue: {
+    marginTop: 2,
+    fontSize: 15,
+  },
+  rowSub: {
+    marginTop: 2,
+    fontSize: 12,
+    color: "#666",
+  },
 });
