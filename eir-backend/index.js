@@ -179,8 +179,10 @@ app.get("/fitbit/auth-url", requireAuth, (req, res) => {
     `&client_id=${clientId}` +
     `&redirect_uri=${encodedRedirect}` +
     `&scope=${scope}` +
-    `&state=${encodeURIComponent(uid)}`;
-
+    `&state=${encodeURIComponent(uid)}`+
+	`&prompt=consent`;
+	
+  console.log("Granted scopes:", tokenResponse.scope);
   res.json({ url });
 });
 

@@ -1,70 +1,498 @@
 /**
- * analyze_fitbit_symptoms.js
- *
- * Exports analyzeSymptoms(uid, date, intradayData, dayData, db)
- * - intradayData: { heart, steps, heartError, stepsError, ... } (as stored by fetch module)
- * - dayData: activity/sleep day summary (may be null)
- * - db: admin.firestore() instance (used to compute short baseline from stored docs)
- *
- * Returns object:
- * {
- *   sleep_disruption: { flag: boolean, score: number, reason: string },
- *   hot_flash_events: [{ ts, hr, steps, evidence }],
- *   night_sweats: { flag, score, reason },
- *   fatigue_recovery: { flag, score, reason },
- *   palpitations: [{ ts, hr, durationSecs, evidence }],
- *   meta: { baseline: {...} }
- * }
- *
- * Heuristics are intentionally conservative and include evidence to help tune thresholds.
+ * Analyze Fitbit intraday data for menopause-related symptom indicators
+ * Outputs both raw indicators + a user-friendly menopauseSummary
  */
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-
+// ---------- time helpers ----------
 function toSec(hhmmss) {
-  // "12:34:00" -> seconds
-  const [h, m, s] = String(hhmmss || "0:0:0").split(":").map(Number);
-  return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
+  const [hh, mm, ss] = String(hhmmss || "0:0:0").split(":").map(Number);
+  return (hh || 0) * 3600 + (mm || 0) * 60 + (ss || 0);
 }
 
-function inNightWindow(startTime) {
-  // Night = 10pm–6am (fallback if sleep window not available)
-  const t = toSec(startTime);
-  const start = 22 * 3600; // 22:00
-  const end = 6 * 3600;    // 06:00
-  return t >= start || t <= end; // crosses midnight
+function isNight(timeStr) {
+  // Night window: 10pm–6am (crosses midnight)
+  const t = toSec(timeStr);
+  return t >= 22 * 3600 || t <= 6 * 3600;
 }
 
-function clusterEventsByStartTime(events, clusterMinutes = 10) {
-  // Deduplicate overlapping detections: cluster by startTime proximity
-  const sorted = [...(events || [])].sort((a, b) => toSec(a.startTime) - toSec(b.startTime));
+// ---------- clustering ----------
+function clusterHotFlashes(events, clusterMinutes = 10) {
+  const sorted = [...(events || [])]
+    .filter(e => e?.startTime)
+    .sort((a, b) => toSec(a.startTime) - toSec(b.startTime));
+
   const clusters = [];
+  let lastClusterStartSec = null;
 
   for (const e of sorted) {
-    if (!e?.startTime) continue;
-    const t = toSec(e.startTime);
+    const sec = toSec(e.startTime);
 
-    const last = clusters[clusters.length - 1];
-    if (!last) {
-      clusters.push({ startTime: e.startTime, endTime: e.endTime, maxDelta: e.delta || 0 });
-      continue;
-    }
-
-    const lastT = toSec(last.startTime);
-    const gapSec = t - lastT;
-
-    if (gapSec <= clusterMinutes * 60) {
-      // same cluster
+    if (
+      lastClusterStartSec === null ||
+      sec - lastClusterStartSec > clusterMinutes * 60
+    ) {
+      clusters.push({
+        startTime: e.startTime,
+        endTime: e.endTime || null,
+        maxDelta: e.delta || 0,
+        peakHr: e.peakHr || null,
+      });
+      lastClusterStartSec = sec;
+    } else {
+      // merge with previous cluster
+      const last = clusters[clusters.length - 1];
       last.endTime = e.endTime || last.endTime;
       last.maxDelta = Math.max(last.maxDelta, e.delta || 0);
-    } else {
-      clusters.push({ startTime: e.startTime, endTime: e.endTime, maxDelta: e.delta || 0 });
+      last.peakHr = Math.max(last.peakHr || 0, e.peakHr || 0);
     }
   }
+
   return clusters;
 }
 
+
+function median(arr) {
+  if (!arr || arr.length === 0) return null;
+  const a = [...arr].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+function addMinutesToTimeStr(hhmmss, minutes) {
+  const sec = toSec(hhmmss);
+  const sec2 = (sec + minutes * 60 + 24 * 3600) % (24 * 3600);
+  const hh = String(Math.floor(sec2 / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((sec2 % 3600) / 60)).padStart(2, "0");
+  const ss = String(sec2 % 60).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+function parseIso(isoStr) {
+  // Fitbit sleep strings look like "2026-01-05T21:24:00.000"
+  // JS Date can parse this as local-time-ish; that's fine for “inSleep” gating.
+  // If you later want strict TZ handling, use luxon/dayjs.
+  const d = new Date(isoStr);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function median(arr) {
+  if (!arr || arr.length === 0) return null;
+  const a = [...arr].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+function addMinutesToTimeStr(hhmmss, minutes) {
+  const sec = toSec(hhmmss);
+  const sec2 = (sec + minutes * 60 + 24 * 3600) % (24 * 3600);
+  const hh = String(Math.floor(sec2 / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((sec2 % 3600) / 60)).padStart(2, "0");
+  const ss = String(sec2 % 60).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+function parseIso(isoStr) {
+  // Fitbit sleep strings look like "2026-01-05T21:24:00.000"
+  // JS Date can parse this as local-time-ish; that's fine for “inSleep” gating.
+  // If you later want strict TZ handling, use luxon/dayjs.
+  const d = new Date(isoStr);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function timeOnDateToDate(dateYYYYMMDD, hhmmss) {
+  // local date/time
+  return new Date(`${dateYYYYMMDD}T${hhmmss}`);
+}
+
+function isInSleepWindow(dateYYYYMMDD, hhmmss, sleepStartIso, sleepEndIso) {
+  const start = parseIso(sleepStartIso);
+  const end = parseIso(sleepEndIso);
+  if (!start || !end) return false;
+
+  // If sleep crosses midnight, a time like 01:00 belongs to the next day.
+  // We'll try both “date” and “date-1” and see which lands inside the window.
+  const t1 = timeOnDateToDate(dateYYYYMMDD, hhmmss);
+
+  const d = new Date(`${dateYYYYMMDD}T00:00:00`);
+  d.setDate(d.getDate() - 1);
+  const prevDate = d.toISOString().slice(0, 10);
+  const t0 = timeOnDateToDate(prevDate, hhmmss);
+
+  return (t0 >= start && t0 <= end) || (t1 >= start && t1 <= end);
+}
+
+/**
+ * Detect hot flashes from HR spikes when steps are low.
+ *
+ * Key idea:
+ * - baseline = rolling median HR from previous N minutes where steps are low
+ * - start event when HR >= baseline + startDelta AND steps are low
+ * - end event when HR drops near baseline OR steps rise
+ * - require low steps in the minutes *before* the start (to avoid “exercise starts”)
+ */
+function detectHotFlashes({
+  date,
+  hrSeries,
+  stepsSeries,
+  sleepStartIso = null,
+  sleepEndIso = null,
+  opts = {},
+}) {
+  const config = {
+    baselineWindowMin: 30,     // rolling baseline window
+    lowStepsMax: 2,            // “rest” steps per minute threshold
+    preLowStepsMin: 5,         // require low steps for last X minutes before start
+    startDeltaBpm: 15,         // HR must exceed baseline by this to start
+    endDeltaBpm: 8,            // event ends when HR returns near baseline
+    minDurationMin: 2,         // at least this many minutes to count
+    maxDurationMin: 20,        // cap runaway events
+    cooldownMin: 10,           // don’t start a new event too soon after one ends
+    maxStepsDuringEvent: 10,   // total steps during event must stay low
+    ...opts,
+  };
+
+  const stepsByTime = {};
+  for (const s of stepsSeries || []) stepsByTime[s.time] = Number(s.value || 0);
+
+  const events = [];
+  let i = 0;
+  let lastEventEndIdx = -999999;
+
+  while (i < (hrSeries || []).length) {
+    if (i - lastEventEndIdx < config.cooldownMin) {
+      i++;
+      continue;
+    }
+
+    const cur = hrSeries[i];
+    if (!cur?.time) {
+      i++;
+      continue;
+    }
+
+    const curSteps = stepsByTime[cur.time] ?? 0;
+    if (curSteps > config.lowStepsMax) {
+      i++;
+      continue;
+    }
+
+    // Require low steps for the last preLowStepsMin minutes too (precondition)
+    let preOk = true;
+    for (let p = 1; p <= config.preLowStepsMin; p++) {
+      const prevIdx = i - p;
+      if (prevIdx < 0) break;
+      const prevTime = hrSeries[prevIdx]?.time;
+      if (!prevTime) continue;
+      const prevSteps = stepsByTime[prevTime] ?? 0;
+      if (prevSteps > config.lowStepsMax) {
+        preOk = false;
+        break;
+      }
+    }
+    if (!preOk) {
+      i++;
+      continue;
+    }
+
+    // Build rolling baseline from previous baselineWindowMin minutes during low steps
+    const baselineSamples = [];
+    for (let j = Math.max(0, i - config.baselineWindowMin); j < i; j++) {
+      const t = hrSeries[j]?.time;
+      if (!t) continue;
+      const st = stepsByTime[t] ?? 0;
+      if (st <= config.lowStepsMax) baselineSamples.push(Number(hrSeries[j]?.value || 0));
+    }
+    const baseline = median(baselineSamples);
+    if (baseline == null) {
+      i++;
+      continue;
+    }
+
+    const curHr = Number(cur.value || 0);
+    if (curHr < baseline + config.startDeltaBpm) {
+      i++;
+      continue;
+    }
+
+    // Start an event; scan forward until it ends
+    const startIdx = i;
+    const startTime = cur.time;
+    const startHr = curHr;
+
+    let peakHr = curHr;
+    let peakTime = cur.time;
+    let stepsSum = curSteps;
+
+    let endIdx = i;
+    for (let k = i + 1; k < hrSeries.length; k++) {
+      const pt = hrSeries[k];
+      if (!pt?.time) break;
+
+      const hr = Number(pt.value || 0);
+      const st = stepsByTime[pt.time] ?? 0;
+
+      stepsSum += st;
+
+      if (hr > peakHr) {
+        peakHr = hr;
+        peakTime = pt.time;
+      }
+
+      const durMin = k - startIdx + 1;
+
+      // stop conditions
+      if (st > config.lowStepsMax) {
+        endIdx = k - 1;
+        break;
+      }
+      if (stepsSum > config.maxStepsDuringEvent) {
+        endIdx = k - 1;
+        break;
+      }
+      if (durMin >= config.minDurationMin && hr <= baseline + config.endDeltaBpm) {
+        endIdx = k;
+        break;
+      }
+      if (durMin >= config.maxDurationMin) {
+        endIdx = k;
+        break;
+      }
+
+      endIdx = k;
+    }
+
+    const durationMin = endIdx - startIdx + 1;
+    if (durationMin >= config.minDurationMin) {
+      const endTime = hrSeries[endIdx]?.time ?? addMinutesToTimeStr(startTime, durationMin - 1);
+
+      const inSleep =
+        sleepStartIso && sleepEndIso
+          ? isInSleepWindow(date, startTime, sleepStartIso, sleepEndIso)
+          : false;
+
+      events.push({
+        startTime,
+        endTime,
+        peakTime,
+        startHr,
+        peakHr,
+        baselineHr: baseline,
+        deltaBpm: peakHr - baseline,
+        stepsInWindow: stepsSum,
+        durationMin,
+        inSleep,
+        evidence: "hr_spike_low_steps_baseline",
+      });
+
+      lastEventEndIdx = endIdx;
+      i = endIdx + 1; // jump past the event so we don’t double-count
+      continue;
+    }
+
+    i++;
+  }
+
+  return events;
+}
+
+
+function timeOnDateToDate(dateYYYYMMDD, hhmmss) {
+  // local date/time
+  return new Date(`${dateYYYYMMDD}T${hhmmss}`);
+}
+
+function isInSleepWindow(dateYYYYMMDD, hhmmss, sleepStartIso, sleepEndIso) {
+  const start = parseIso(sleepStartIso);
+  const end = parseIso(sleepEndIso);
+  if (!start || !end) return false;
+
+  // If sleep crosses midnight, a time like 01:00 belongs to the next day.
+  // We'll try both “date” and “date-1” and see which lands inside the window.
+  const t1 = timeOnDateToDate(dateYYYYMMDD, hhmmss);
+
+  const d = new Date(`${dateYYYYMMDD}T00:00:00`);
+  d.setDate(d.getDate() - 1);
+  const prevDate = d.toISOString().slice(0, 10);
+  const t0 = timeOnDateToDate(prevDate, hhmmss);
+
+  return (t0 >= start && t0 <= end) || (t1 >= start && t1 <= end);
+}
+
+/**
+ * Detect hot flashes from HR spikes when steps are low.
+ *
+ * Key idea:
+ * - baseline = rolling median HR from previous N minutes where steps are low
+ * - start event when HR >= baseline + startDelta AND steps are low
+ * - end event when HR drops near baseline OR steps rise
+ * - require low steps in the minutes *before* the start (to avoid “exercise starts”)
+ */
+function detectHotFlashes({
+  date,
+  hrSeries,
+  stepsSeries,
+  sleepStartIso = null,
+  sleepEndIso = null,
+  opts = {},
+}) {
+  const config = {
+    baselineWindowMin: 30,     // rolling baseline window
+    lowStepsMax: 2,            // “rest” steps per minute threshold
+    preLowStepsMin: 5,         // require low steps for last X minutes before start
+    startDeltaBpm: 15,         // HR must exceed baseline by this to start
+    endDeltaBpm: 8,            // event ends when HR returns near baseline
+    minDurationMin: 2,         // at least this many minutes to count
+    maxDurationMin: 20,        // cap runaway events
+    cooldownMin: 10,           // don’t start a new event too soon after one ends
+    maxStepsDuringEvent: 10,   // total steps during event must stay low
+    ...opts,
+  };
+
+  const stepsByTime = {};
+  for (const s of stepsSeries || []) stepsByTime[s.time] = Number(s.value || 0);
+
+  const events = [];
+  let i = 0;
+  let lastEventEndIdx = -999999;
+
+  while (i < (hrSeries || []).length) {
+    if (i - lastEventEndIdx < config.cooldownMin) {
+      i++;
+      continue;
+    }
+
+    const cur = hrSeries[i];
+    if (!cur?.time) {
+      i++;
+      continue;
+    }
+
+    const curSteps = stepsByTime[cur.time] ?? 0;
+    if (curSteps > config.lowStepsMax) {
+      i++;
+      continue;
+    }
+
+    // Require low steps for the last preLowStepsMin minutes too (precondition)
+    let preOk = true;
+    for (let p = 1; p <= config.preLowStepsMin; p++) {
+      const prevIdx = i - p;
+      if (prevIdx < 0) break;
+      const prevTime = hrSeries[prevIdx]?.time;
+      if (!prevTime) continue;
+      const prevSteps = stepsByTime[prevTime] ?? 0;
+      if (prevSteps > config.lowStepsMax) {
+        preOk = false;
+        break;
+      }
+    }
+    if (!preOk) {
+      i++;
+      continue;
+    }
+
+    // Build rolling baseline from previous baselineWindowMin minutes during low steps
+    const baselineSamples = [];
+    for (let j = Math.max(0, i - config.baselineWindowMin); j < i; j++) {
+      const t = hrSeries[j]?.time;
+      if (!t) continue;
+      const st = stepsByTime[t] ?? 0;
+      if (st <= config.lowStepsMax) baselineSamples.push(Number(hrSeries[j]?.value || 0));
+    }
+    const baseline = median(baselineSamples);
+    if (baseline == null) {
+      i++;
+      continue;
+    }
+
+    const curHr = Number(cur.value || 0);
+    if (curHr < baseline + config.startDeltaBpm) {
+      i++;
+      continue;
+    }
+
+    // Start an event; scan forward until it ends
+    const startIdx = i;
+    const startTime = cur.time;
+    const startHr = curHr;
+
+    let peakHr = curHr;
+    let peakTime = cur.time;
+    let stepsSum = curSteps;
+
+    let endIdx = i;
+    for (let k = i + 1; k < hrSeries.length; k++) {
+      const pt = hrSeries[k];
+      if (!pt?.time) break;
+
+      const hr = Number(pt.value || 0);
+      const st = stepsByTime[pt.time] ?? 0;
+
+      stepsSum += st;
+
+      if (hr > peakHr) {
+        peakHr = hr;
+        peakTime = pt.time;
+      }
+
+      const durMin = k - startIdx + 1;
+
+      // stop conditions
+      if (st > config.lowStepsMax) {
+        endIdx = k - 1;
+        break;
+      }
+      if (stepsSum > config.maxStepsDuringEvent) {
+        endIdx = k - 1;
+        break;
+      }
+      if (durMin >= config.minDurationMin && hr <= baseline + config.endDeltaBpm) {
+        endIdx = k;
+        break;
+      }
+      if (durMin >= config.maxDurationMin) {
+        endIdx = k;
+        break;
+      }
+
+      endIdx = k;
+    }
+
+    const durationMin = endIdx - startIdx + 1;
+    if (durationMin >= config.minDurationMin) {
+      const endTime = hrSeries[endIdx]?.time ?? addMinutesToTimeStr(startTime, durationMin - 1);
+
+      const inSleep =
+        sleepStartIso && sleepEndIso
+          ? isInSleepWindow(date, startTime, sleepStartIso, sleepEndIso)
+          : false;
+
+      events.push({
+        startTime,
+        endTime,
+        peakTime,
+        startHr,
+        peakHr,
+        baselineHr: baseline,
+        deltaBpm: peakHr - baseline,
+        stepsInWindow: stepsSum,
+        durationMin,
+        inSleep,
+        evidence: "hr_spike_low_steps_baseline",
+      });
+
+      lastEventEndIdx = endIdx;
+      i = endIdx + 1; // jump past the event so we don’t double-count
+      continue;
+    }
+
+    i++;
+  }
+
+  return events;
+}
+
+// ---------- scoring helpers ----------
 function severityFromCount(count) {
   if (!count || count <= 0) return "None";
   if (count <= 2) return "Low";
@@ -73,27 +501,32 @@ function severityFromCount(count) {
 }
 
 function score01FromCount(count, denom) {
-  if (!denom) denom = 5;
-  return Math.max(0, Math.min(1, (count || 0) / denom));
+  const d = denom || 5;
+  return Math.max(0, Math.min(1, (count || 0) / d));
 }
 
-
+// ---------- menopause summary ----------
 function buildMenopauseSummary(indicators) {
   const events = indicators?.hot_flash_events || [];
 
-  // 1) Hot flashes = clustered HR spike events
-  const hotFlashClusters = clusterEventsByStartTime(events, 10);
+  // 1) Deduplicate hot flashes
+  const hotFlashClusters = clusterHotFlashes(events, 10);
   const hotFlashesCount = hotFlashClusters.length;
 
-  // 2) Night sweats = hot flash clusters occurring at night (10pm–6am)
-  const nightClusters = hotFlashClusters.filter(c => inNightWindow(c.startTime));
+  // 2) Night sweats = night hot-flash clusters
+  const nightClusters = hotFlashClusters.filter(c =>
+    isNight(c.startTime)
+  );
   const nightSweatsCount = nightClusters.length;
 
-  // 3) Sleep disruption = based on night sweats (simple MVP)
-  // later you can incorporate sleep minutes, awakenings, etc.
+  // 3) Sleep disruption = driven by night events (MVP logic)
+  const derivedSleepDisruption = score01FromCount(nightSweatsCount, 3);
+  const existingSleepDisruption = Number(
+    indicators?.sleep_disruption?.score || 0
+  );
   const sleepDisruptionScore = Math.max(
-    score01FromCount(nightSweatsCount, 3), // 3+ night events = high disruption
-    indicators?.sleep_disruption?.score || 0 // if your analyzer sets this later
+    derivedSleepDisruption,
+    existingSleepDisruption
   );
 
   return {
@@ -101,521 +534,156 @@ function buildMenopauseSummary(indicators) {
       count: hotFlashesCount,
       severity: severityFromCount(hotFlashesCount),
       score: score01FromCount(hotFlashesCount, 5),
-      sampleTimes: hotFlashClusters.slice(0, 3).map(c => `${c.startTime}–${c.endTime || ""}`),
+      sampleTimes: hotFlashClusters
+        .slice(0, 3)
+        .map(c => `${c.startTime}–${c.endTime || ""}`),
     },
     nightSweats: {
       count: nightSweatsCount,
       severity: severityFromCount(nightSweatsCount),
       score: score01FromCount(nightSweatsCount, 3),
-      sampleTimes: nightClusters.slice(0, 3).map(c => `${c.startTime}–${c.endTime || ""}`),
+      sampleTimes: nightClusters
+        .slice(0, 3)
+        .map(c => `${c.startTime}–${c.endTime || ""}`),
     },
     sleepDisruption: {
       severity:
-        sleepDisruptionScore >= 0.75 ? "High" :
-        sleepDisruptionScore >= 0.4 ? "Moderate" :
-        sleepDisruptionScore > 0 ? "Low" : "None",
+        sleepDisruptionScore >= 0.75
+          ? "High"
+          : sleepDisruptionScore >= 0.4
+          ? "Moderate"
+          : sleepDisruptionScore > 0
+          ? "Low"
+          : "None",
       score: Number(sleepDisruptionScore.toFixed(2)),
-      reason: nightSweatsCount > 0 ? "Night events detected" : "",
+      reason:
+        nightSweatsCount > 0
+          ? `Night hot-flash events detected (${nightSweatsCount})`
+          : "",
     },
   };
 }
 
-
-function safeNumber(v, fallback = null) {
-  if (typeof v === 'number' && !isNaN(v)) return v;
-  return fallback;
-}
-
-async function computeBaseline(db, uid, date, lookbackDays = 7) {
-  // Query recent fitbitIntraday documents prior to `date` to compute median steps / sleep / restingHR
-  // Expect doc ids like `${uid}_${YYYY-MM-DD}`
-  try {
-    const snap = await db
-      .collection('fitbitIntraday')
-      .where('userId', '==', String(uid))
-      .orderBy('date', 'desc')
-      .limit(lookbackDays + 1)
-      .get();
-
-    const items = snap.docs
-      .map((d) => d.data())
-      .filter((x) => x && x.date && x.date !== date)
-      .slice(0, lookbackDays);
-
-    const stepsArr = [];
-    const sleepArr = [];
-    const restingHRArr = [];
-
-    for (const it of items) {
-      const day = it.data?.day || null;
-      const intraday = it.data?.intraday || null;
-
-      const steps = safeNumber(day?.summary?.steps ?? day?.activity?.summary?.steps);
-      if (steps !== null) stepsArr.push(steps);
-
-      const sleepMin =
-        safeNumber(day?.summary?.sleepMinutes) ??
-        safeNumber(day?.sleep?.summary?.totalMinutesAsleep);
-      if (sleepMin !== null) sleepArr.push(sleepMin);
-
-      // resting HR might be in activity summary or be derivable from day or intraday
-      const resting = safeNumber(day?.activity?.summary?.restingHeartRate ?? day?.activity?.summary?.restingHeartRate);
-      if (resting !== null) restingHRArr.push(resting);
-    }
-
-    const median = (arr) => {
-      if (!arr.length) return null;
-      const s = arr.slice().sort((a, b) => a - b);
-      const mid = Math.floor(s.length / 2);
-      return s.length % 2 === 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-    };
-
-    return {
-      stepsMedian: median(stepsArr),
-      sleepMedian: median(sleepArr),
-      restingHRMedian: median(restingHRArr),
-      sampleCount: items.length,
-    };
-  } catch (err) {
-    console.warn('computeBaseline error', err?.message || err);
-    return { stepsMedian: null, sleepMedian: null, restingHRMedian: null, sampleCount: 0 };
-  }
-}
-
-function parseIntradayHeartSamples(hrData) {
-  // Expect hrData to be Fitbit heart intraday object:
-  // hrData: { 'activities-heart-intraday': { dataset: [{time: "HH:MM:SS", value: <bpm>}, ...] } }
-  // Or heartData.activities-heart-intraday.dataset depending on API response
-  try {
-    const key = hrData?.['activities-heart-intraday'] ? 'activities-heart-intraday' : 'activities-heart';
-    // prefer intraday dataset if exists
-    const intraday = hrData?.['activities-heart-intraday'] ?? hrData?.['activities-heart'] ?? null;
-    if (!intraday) return [];
-    const dataset = intraday.dataset || intraday?.data || [];
-    // dataset entries: { time: "HH:MM:SS", value: 72 } or sometimes { "time": "00:00:00", "value": 72 }
-    return dataset.map((p) => {
-      let t = p.time || p.dateTime || p.timestamp;
-      // Keep time string; timestamp decoding happens elsewhere if needed
-      return { time: t, value: safeNumber(p.value, null) };
-    }).filter((p) => p.value !== null);
-  } catch (err) {
-    return [];
-  }
-}
-
-function parseIntradayStepsSamples(stepsData) {
-  try {
-    const intraday = stepsData?.['activities-steps-intraday'] ?? stepsData;
-    const dataset = intraday?.dataset || intraday?.data || [];
-    return dataset.map((p) => ({ time: p.time || p.dateTime, value: safeNumber(p.value, null) })).filter((p) => p.value !== null);
-  } catch (err) {
-    return [];
-  }
-}
-
-function findRapidHrSpikes(hrSamples, windowSec = 300, deltaBpm = 20) {
-  // Find times where HR increases by >= deltaBpm within windowSec (e.g., 5 minutes)
-  // hrSamples: array of {time, value} ordered by time ascending
-  const spikes = [];
-  for (let i = 0; i < hrSamples.length; i++) {
-    const base = hrSamples[i];
-    for (let j = i + 1; j < hrSamples.length; j++) {
-      // compute approximate seconds difference based on time strings (HH:MM:SS)
-      // Here we only work on same-day times, so convert HH:MM:SS to seconds
-      const t1 = timeToSec(base.time);
-      const t2 = timeToSec(hrSamples[j].time);
-      if (t2 - t1 > windowSec) break;
-      if (hrSamples[j].value - base.value >= deltaBpm) {
-        spikes.push({
-          startTime: base.time,
-          endTime: hrSamples[j].time,
-          startHr: base.value,
-          peakHr: hrSamples[j].value,
-          delta: hrSamples[j].value - base.value,
-          windowSec: t2 - t1,
-        });
-        break; // record one spike per base
-      }
-    }
-  }
-  return spikes;
-}
-
-function timeToSec(timeStr) {
-  // timeStr "HH:MM:SS"
-  if (!timeStr) return 0;
-  const parts = ('' + timeStr).split(':').map((s) => parseInt(s, 10));
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return parts[0] || 0;
-}
-
-function mean(arr) {
-  if (!arr.length) return null;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
-
-// Determine sleep period time range from dayData.sleep (if available)
-function getSleepPeriod(daySleep) {
-  // Fitbit sleep object may have sleep[0].startTime , .endTime ; return start and end as local time strings HH:MM:SS
-  try {
-    const sleepList = daySleep?.sleep;
-    if (Array.isArray(sleepList) && sleepList.length > 0) {
-      const seg = sleepList[0];
-      // startTime/endTime format: "2026-01-02T23:22:00.000"
-      const s = seg.startTime || seg.start;
-      const e = seg.endTime || seg.end;
-      if (s && e) {
-        // return ISO times
-        return { start: s, end: e, rawSegment: seg };
-      }
-    }
-  } catch (err) {}
-  return null;
-}
-
-function isoToTimeSec(isoStr) {
-  // isoStr like "2026-01-05T23:22:00.000"
-  if (!isoStr || typeof isoStr !== "string") return null;
-  const tPart = isoStr.split("T")[1];
-  if (!tPart) return null;
-  const hhmmss = tPart.split(".")[0]; // "23:22:00"
-  return timeToSec(hhmmss);
-}
-
-function inSleepWindow(timeStr, sleepPeriod) {
-  // timeStr is intraday "HH:MM:SS"
-  // sleepPeriod.start/end are ISO strings
-  if (!sleepPeriod?.start || !sleepPeriod?.end || !timeStr) return false;
-
-  const t = timeToSec(timeStr);
-  const s = isoToTimeSec(sleepPeriod.start);
-  const e = isoToTimeSec(sleepPeriod.end);
-  if (s === null || e === null) return false;
-
-  // handle sleep that crosses midnight (e.g. 23:00 -> 06:00)
-  if (e >= s) {
-    return t >= s && t <= e;
-  } else {
-    // crosses midnight: in window if t >= start OR t <= end
-    return t >= s || t <= e;
-  }
-}
-
-
+// ---------- MAIN ANALYZER ----------
 async function analyzeSymptoms(uid, date, intradayData, dayData, db) {
-  // intradayData: { heart, steps, heartError, stepsError }
-  // dayData: object with activity and sleep summaries
-  const baseline = await computeBaseline(db, uid, date, 14);
+  const indicators = {
+    fatigue_recovery: { flag: false, score: 0, reason: "" },
+    night_sweats: { flag: false, score: 0, reason: "" },
+    sleep_disruption: { flag: false, score: 0, reason: "" },
+    hot_flash_events: [],
+    palpitations: [],
+    meta: {},
+  };
 
-  const hrSamples = parseIntradayHeartSamples(intradayData?.heart || {});
-  const stepsSamples = parseIntradayStepsSamples(intradayData?.steps || {});
+  const hrSeries = intradayData?.["activities-heart-intraday"]?.dataset || [];
+  const stepsSeries = intradayData?.["activities-steps-intraday"]?.dataset || [];
 
-  // compute simple stats
-  const hrValues = hrSamples.map((s) => s.value);
-  const hrMean = hrValues.length ? mean(hrValues) : null;
-  const hrMax = hrValues.length ? Math.max(...hrValues) : null;
+  const stepsByTime = {};
+  for (const s of stepsSeries) stepsByTime[s.time] = Number(s.value || 0);
 
-  const totalSteps = safeNumber(dayData?.summary?.steps ?? dayData?.activity?.summary?.steps ?? null) ??
-    (stepsSamples.length ? stepsSamples.reduce((a, b) => a + (b.value || 0), 0) : null);
+  // ---------- hot flash detection (deduped) ----------
+  const DELTA_THRESHOLD = 20;     // bpm rise within window
+  const WINDOW_SEC = 5 * 60;      // 5 minutes
+  const MAX_STEPS_IN_WINDOW = 10; // low movement
+  const COOLDOWN_SEC = 10 * 60;   // avoid back-to-back duplicates
 
-  const sleepMinutes = safeNumber(dayData?.summary?.sleepMinutes ?? dayData?.sleep?.summary?.totalMinutesAsleep ?? null);
+  let lastEventEndSec = -1e12;
 
-  // Heuristics
-  // 1) Sleep disruption
-  let sleep_disruption = { flag: false, score: 0, reason: '' };
-  const shortSleepThreshold = 6 * 60; // 6 hours
-  const awakenings = safeNumber(dayData?.sleep?.summary?.wakeCount ?? dayData?.sleep?.wakeCount ?? null);
-  const sleepEfficiency = safeNumber(dayData?.sleep?.summary?.efficiency ?? null);
+  for (let i = 0; i < hrSeries.length; i++) {
+    const start = hrSeries[i];
+    if (!start?.time) continue;
 
-  if (sleepMinutes !== null && sleepMinutes < shortSleepThreshold) {
-    sleep_disruption.flag = true;
-    sleep_disruption.score += 0.6;
-    sleep_disruption.reason += `short_sleep (${sleepMinutes}m) `;
-  }
-  if ( awakenings !== null && awakenings >= 3 ) {
-    sleep_disruption.flag = true;
-    sleep_disruption.score += 0.3;
-    sleep_disruption.reason += `wake_count(${awakenings}) `;
-  }
-  if ( sleepEfficiency !== null && sleepEfficiency < 80 ) {
-    sleep_disruption.flag = true;
-    sleep_disruption.score += 0.2;
-    sleep_disruption.reason += `efficiency(${sleepEfficiency}) `;
-  }
+    const startHr = Number(start.value);
+    if (!Number.isFinite(startHr)) continue;
 
-  // Compare to baseline sleep median
-  if (baseline.sleepMedian && sleepMinutes !== null) {
-    if (sleepMinutes < baseline.sleepMedian * 0.8) {
-      sleep_disruption.flag = true;
-      sleep_disruption.score += 0.4;
-      sleep_disruption.reason += `drop_from_baseline(${baseline.sleepMedian}→${sleepMinutes}) `;
+    const startSec = toSec(start.time);
+    if (startSec < lastEventEndSec + COOLDOWN_SEC) continue;
+
+    let peakHr = startHr;
+    let peakTime = start.time;
+    let stepsSum = stepsByTime[start.time] || 0;
+
+    let endTime = start.time;
+    let endIdx = i;
+
+    for (let j = i + 1; j < hrSeries.length; j++) {
+      const cur = hrSeries[j];
+      if (!cur?.time) break;
+
+      const curSec = toSec(cur.time);
+      if (curSec - startSec > WINDOW_SEC) break;
+
+      const curHr = Number(cur.value);
+      if (Number.isFinite(curHr) && curHr > peakHr) {
+        peakHr = curHr;
+        peakTime = cur.time;
+      }
+
+      stepsSum += stepsByTime[cur.time] || 0;
+      endTime = cur.time;
+      endIdx = j;
+    }
+
+    const delta = peakHr - startHr;
+
+    if (delta >= DELTA_THRESHOLD && stepsSum <= MAX_STEPS_IN_WINDOW) {
+      indicators.hot_flash_events.push({
+        startTime: start.time,
+        endTime,
+        peakTime,
+        startHr,
+        peakHr,
+        delta,
+        stepsInWindow: stepsSum,
+        windowSec: toSec(endTime) - startSec,
+        evidence: "hr_spike_low_steps",
+      });
+
+      // ✅ Jump forward so we don’t double-count the same episode
+      lastEventEndSec = toSec(endTime);
+      i = endIdx;
     }
   }
 
-  // cap score
-  sleep_disruption.score = Math.min(1, sleep_disruption.score);
+  // ---------- palpitations ----------
+  for (let i = 0; i < hrSeries.length; i++) {
+    const h = hrSeries[i];
+    if (!h?.time) continue;
 
-  // 2) Hot flashes (event-tagged via HR spikes during low activity or during sleep)
-  const spikes = findRapidHrSpikes(hrSamples, 300, 20); // 5min window, 20 bpm
-  const hot_flash_events = [];
-  for (const s of spikes) {
-    // check steps around spike (±5min) to ensure low activity
-    const tStartSec = timeToSec(s.startTime);
-    const tEndSec = timeToSec(s.endTime);
-    const windowBefore = stepsSamples.filter((p) => {
-      const t = timeToSec(p.time);
-      return t >= (tStartSec - 300) && t <= (tEndSec + 300);
-    });
-    const windowSteps = windowBefore.reduce((a, b) => a + (b.value || 0), 0);
-    if (windowSteps <= 20) {
-      hot_flash_events.push({
-        startTime: s.startTime,
-        endTime: s.endTime,
-        startHr: s.startHr,
-        peakHr: s.peakHr,
-        delta: s.delta,
-        windowSec: s.windowSec,
-        stepsInWindow: windowSteps,
-        evidence: 'hr_spike_low_steps',
+    const hr = Number(h.value);
+    const st = stepsByTime[h.time] || 0;
+
+    if (hr >= 120 && st === 0) {
+      indicators.palpitations.push({
+        startTime: h.time,
+        endTime: h.time,
+        avgHr: hr,
+        durationSec: 60,
+        stepsInWindow: 0,
+        evidence: "high_hr_low_steps",
       });
     }
   }
 
-  // 3) Night sweats (sleep proxy) — detect elevated HR during sleep period
-  let night_sweats = { flag: false, score: 0, reason: '' };
-  const sleepPeriod = getSleepPeriod(dayData?.sleep);
-  if (sleepPeriod) {
-    // gather hr samples that fall in sleep window
-    const hrInSleep = hrSamples.filter((p) => inSleepWindow(p.time, sleepPeriod));
-    const hrInSleepValues = hrInSleep.map((p) => p.value);
-    const sleepHrMean = hrInSleepValues.length ? mean(hrInSleepValues) : null;
-    if (sleepHrMean !== null && baseline.restingHRMedian !== null) {
-      // if mean sleep hr is elevated > 8 bpm above resting
-      if (sleepHrMean - baseline.restingHRMedian >= 8) {
-        night_sweats.flag = true;
-        night_sweats.score += 0.6;
-        night_sweats.reason += `elevated_sleep_hr(${sleepHrMean} vs baseline ${baseline.restingHRMedian}) `;
-      }
-    }
-    // also if many short wake fragments (wakeCount high) + HR spikes in sleep -> night sweats
-    if (awakenings !== null && awakenings >= 3 && hrInSleepValues.some((h) => h >= (baseline.restingHRMedian ? baseline.restingHRMedian + 10 : 90))) {
-      night_sweats.flag = true;
-      night_sweats.score += 0.4;
-      night_sweats.reason += 'wake_count_with_hr_spike ';
-    }
-    night_sweats.score = Math.min(1, night_sweats.score);
-  }
+  // ---------- meta ----------
+  const hrValues = hrSeries.map(h => Number(h.value)).filter(Number.isFinite);
 
-  // 4) Fatigue / recovery: detect elevated resting HR vs baseline OR low sleep
-  let fatigue_recovery = { flag: false, score: 0, reason: '' };
-  const restingHRToday = safeNumber(dayData?.activity?.summary?.restingHeartRate ?? dayData?.activity?.summary?.restingHeartRate ?? null);
-  if (restingHRToday !== null && baseline.restingHRMedian !== null) {
-    if (restingHRToday - baseline.restingHRMedian >= 5) {
-      fatigue_recovery.flag = true;
-      fatigue_recovery.score += 0.6;
-      fatigue_recovery.reason += `restingHR_up(${restingHRToday} vs ${baseline.restingHRMedian}) `;
-    }
-  }
-  if (sleepMinutes !== null && baseline.sleepMedian !== null) {
-    if (sleepMinutes < baseline.sleepMedian * 0.8) {
-      fatigue_recovery.flag = true;
-      fatigue_recovery.score += 0.4;
-      fatigue_recovery.reason += `low_sleep_vs_baseline(${sleepMinutes} vs ${baseline.sleepMedian}) `;
-    }
-  } else if (sleepMinutes !== null && sleepMinutes < 6 * 60) {
-    fatigue_recovery.flag = true;
-    fatigue_recovery.score += 0.3;
-    fatigue_recovery.reason += `short_sleep(${sleepMinutes}) `;
-  }
-  fatigue_recovery.score = Math.min(1, fatigue_recovery.score);
-
-  // 5) Palpitations: look for rapid HR episodes at rest (HR > 120 sustained > 30s during low activity)
-  const palpitations = [];
-  const hrThreshold = 120;
-  const minDurationSec = 30;
-  // find contiguous runs in hrSamples where hr >= threshold
-  let runStart = null, runVals = [];
-  for (let i = 0; i < hrSamples.length; i++) {
-    const s = hrSamples[i];
-    if (s.value >= hrThreshold) {
-      if (!runStart) {
-        runStart = s;
-        runVals = [s];
-      } else {
-        runVals.push(s);
-      }
-    } else {
-      if (runStart) {
-        // compute duration approx from times
-        const duration = timeToSec(runVals[runVals.length - 1].time) - timeToSec(runStart.time);
-        if (duration >= minDurationSec) {
-          // check steps around period (±60s)
-          const t1 = timeToSec(runStart.time) - 60;
-          const t2 = timeToSec(runVals[runVals.length - 1].time) + 60;
-          const stepsInWindow = stepsSamples
-            .filter((p) => {
-              const t = timeToSec(p.time);
-              return t >= t1 && t <= t2;
-            })
-            .reduce((a, b) => a + (b.value || 0), 0);
-          if (stepsInWindow <= 20) {
-            palpitations.push({
-              startTime: runStart.time,
-              endTime: runVals[runVals.length - 1].time,
-              durationSec: duration,
-              avgHr: Math.round(mean(runVals.map((r) => r.value))),
-              stepsInWindow,
-              evidence: 'sustained_high_hr_low_steps',
-            });
-          }
-        }
-        runStart = null;
-        runVals = [];
-      }
-    }
-  }
-  // final tail
-  if (runStart) {
-    const duration = timeToSec(runVals[runVals.length - 1].time) - timeToSec(runStart.time);
-    if (duration >= minDurationSec) {
-      const stepsInWindow = stepsSamples
-        .filter((p) => {
-          const t = timeToSec(p.time);
-          return t >= timeToSec(runStart.time) - 60 && t <= timeToSec(runVals[runVals.length - 1].time) + 60;
-        })
-        .reduce((a, b) => a + (b.value || 0), 0);
-      if (stepsInWindow <= 20) {
-        palpitations.push({
-          startTime: runStart.time,
-          endTime: runVals[runVals.length - 1].time,
-          durationSec: duration,
-          avgHr: Math.round(mean(runVals.map((r) => r.value))),
-          stepsInWindow,
-          evidence: 'sustained_high_hr_low_steps',
-        });
-      }
-    }
-  }
-
-  // Compose output
-  const out = {
-    sleep_disruption,
-    hot_flash_events,
-    night_sweats,
-    fatigue_recovery,
-    palpitations,
-    meta: {
-      baseline,
-      hrMean,
-      hrMax,
-      totalSteps,
-      sleepMinutes,
-      sampleCounts: {
-        hrSamples: hrSamples.length,
-        stepsSamples: stepsSamples.length,
-      },
+  indicators.meta = {
+    totalSteps: dayData?.summary?.steps ?? null,
+    sleepMinutes: dayData?.sleepMinutes ?? dayData?.summary?.sleepMinutes ?? null,
+    hrMax: hrValues.length ? Math.max(...hrValues) : null,
+    hrMean: hrValues.length ? (hrValues.reduce((a, b) => a + b, 0) / hrValues.length) : null,
+    sampleCounts: {
+      hrSamples: hrSeries.length,
+      stepsSamples: stepsSeries.length,
     },
   };
 
-  return out;
-}
-
-async function analyzeFitbitSymptomsForDate(db, uid, date) {
-  // Reads your stored intraday+day doc from fitbitIntraday, analyzes, and stores a "signals" doc.
-  const docId = `${uid}_${date}`;
-  const snap = await db.collection("fitbitIntraday").doc(docId).get();
-
-  if (!snap.exists) {
-    return {
-      date,
-      indicators: null,
-      stored: false,
-      reason: `No fitbitIntraday doc found: ${docId}`,
-    };
-  }
-
-  const data = snap.data() || {};
-  const intradayData = data?.data?.intraday || null;
-  const dayData = data?.data?.day || null;
-
-  if (!intradayData) {
-    return {
-      date,
-      indicators: null,
-      stored: false,
-      reason: "Missing intraday data in stored document",
-    };
-  }
-
-  const indicators = await analyzeSymptoms(uid, date, intradayData, dayData, db);
-
-  // Store indicators so the app can load quickly without re-running analysis every time
-  await db
-    .collection("users")
-    .doc(String(uid))
-    .collection("signals")
-    .doc(String(date))
-    .set(
-      {
-        date,
-        indicators,
-        sourceDocId: docId,
-        generatedAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
-
-  return { date, indicators, stored: true, sourceDocId: docId };
-}
-
-async function analyzeFitbitSymptomsForDate(db, uid, date) {
-  // Reads your stored intraday+day doc from fitbitIntraday, analyzes, and stores a "signals" doc.
-  const docId = `${uid}_${date}`;
-  const snap = await db.collection("fitbitIntraday").doc(docId).get();
-
-  if (!snap.exists) {
-    return {
-      date,
-      indicators: null,
-      stored: false,
-      reason: `No fitbitIntraday doc found: ${docId}`,
-    };
-  }
-
-  const data = snap.data() || {};
-  const intradayData = data?.data?.intraday || null;
-  const dayData = data?.data?.day || null;
-
-  if (!intradayData) {
-    return {
-      date,
-      indicators: null,
-      stored: false,
-      reason: "Missing intraday data in stored document",
-    };
-  }
-
-  const indicators = await analyzeSymptoms(uid, date, intradayData, dayData, db);
-
-  // Store indicators so the app can load quickly without re-running analysis every time
-  await db
-    .collection("users")
-    .doc(String(uid))
-    .collection("signals")
-    .doc(String(date))
-    .set(
-      {
-        date,
-        indicators,
-        sourceDocId: docId,
-        generatedAt: new Date().toISOString(),
-      },
-      { merge: true }
-    );
-
-  return { date, indicators, stored: true, sourceDocId: docId };
+  indicators.menopauseSummary = buildMenopauseSummary(indicators);
+  return indicators;
 }
 
 
-module.exports = { analyzeSymptoms, analyzeFitbitSymptomsForDate };
+module.exports = {
+  analyzeSymptoms,
+};
